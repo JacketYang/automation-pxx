@@ -1,64 +1,70 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-const SAMPLE = "https://detail.1688.com/offer/123456789012.html";
-
+type Job = {
+  id: number; offerId: string; mode: string; status: string; stage: string;
+  title?: string; pddTitle?: string; verdict?: string; reasons?: {level:string;msg:string}[];
+  pricing?: { skus?: {name:string;cost:number;group:number;single:number;profit:number}[]; maxGroup?:number };
+  error?: string; logs?: {t:string;m:string}[]; pddGoodsId?: string;
+};
+const API = "http://127.0.0.1:17368";
+const MODES = [
+  {v:"check",t:"只分析",d:"读取商品、判断风险并核算 SKU 价格"},
+  {v:"fill",t:"分析并填表",d:"自动填写拼多多表单，停在提交前"},
+  {v:"publish",t:"分析并上架",d:"完成填写后尝试提交，请先确认商品资料"},
+] as const;
 export default function Dashboard() {
-  const [urls, setUrls] = useState("");
-  const [mode, setMode] = useState<"check" | "list" | "submit">("list");
-  const [copied, setCopied] = useState(false);
-  const commands = useMemo(() => urls.split(/[\\s，,；;]+/).map((x) => x.trim()).filter(Boolean).map((url) => {
-    const escaped = url.replace(/'/g, "''");
-    if (mode === "check") return `node agent.mjs check '${escaped}'`;
-    if (mode === "submit") return `node agent.mjs list '${escaped}' --submit`;
-    return `node agent.mjs list '${escaped}'`;
-  }).join("\\n"), [urls, mode]);
-
-  async function copy() {
-    await navigator.clipboard.writeText(commands);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1600);
+  const [urls,setUrls]=useState("");
+  const [mode,setMode]=useState<"check"|"fill"|"publish">("fill");
+  const [online,setOnline]=useState(false);
+  const [host,setHost]=useState("");
+  const [jobs,setJobs]=useState<Job[]>([]);
+  const [error,setError]=useState("");
+  const [busy,setBusy]=useState(false);
+  const load=useCallback(async()=>{
+    try {
+      const [h,j]=await Promise.all([fetch(API+"/health",{cache:"no-store"}),fetch(API+"/jobs",{cache:"no-store"})]);
+      if(!h.ok||!j.ok) throw new Error("Agent 未响应");
+      const health=await h.json(); const data=await j.json();
+      setOnline(Boolean(health.online)); setHost(health.host||"本机"); setJobs(data.jobs||[]); setError("");
+    } catch { setOnline(false); setHost(""); }
+  },[]);
+  useEffect(()=>{ load(); const t=window.setInterval(load,1500); return ()=>window.clearInterval(t); },[load]);
+  async function submit(){
+    setBusy(true);setError("");
+    try {
+      const r=await fetch(API+"/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls,mode})});
+      const data=await r.json(); if(!r.ok) throw new Error(data.error||"提交失败");
+      setUrls(""); await load();
+    } catch(e){setError(e instanceof Error?e.message:"提交失败");}
+    finally{setBusy(false);}
   }
-
-  return (
-    <main className="mx-auto max-w-3xl px-4 py-10">
-      <header className="mb-8">
-        <div className="mb-2 text-sm font-medium text-blue-700">PXX · 第一阶段</div>
-        <h1 className="text-3xl font-bold tracking-tight">1688 商品分析 → 拼多多上架</h1>
-        <p className="mt-3 text-slate-600">先把商品分析、SKU 成本核算和上架流程跑通。网页不接数据库，商品浏览器操作在你自己的 Windows 电脑完成。</p>
-      </header>
-      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-        <h2 className="font-semibold">添加 1688 商品链接</h2>
-        <p className="mt-1 text-sm text-slate-500">每行一个链接。这里生成本机 Agent 命令，不会把登录信息或浏览器数据上传到云端。</p>
-        <textarea value={urls} onChange={(e) => setUrls(e.target.value)} rows={5} placeholder={SAMPLE} className="mt-4 w-full rounded-lg border border-slate-300 p-3 font-mono text-sm outline-none focus:border-blue-500" />
-        <div className="mt-4 grid gap-2 sm:grid-cols-3">
-          {([["check", "只分析商品"], ["list", "分析并填表（不提交）"], ["submit", "分析并自动提交"]] as const).map(([value, label]) => (
-            <label key={value} className={`cursor-pointer rounded-lg border p-3 text-sm ${mode === value ? "border-blue-600 bg-blue-50" : "border-slate-200"}`}>
-              <input type="radio" className="mr-2" checked={mode === value} onChange={() => setMode(value)} />{label}
-            </label>
-          ))}
-        </div>
-        <div className="mt-4 flex items-center gap-3">
-          <button disabled={!commands} onClick={copy} className="rounded-lg bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-40">{copied ? "已复制命令" : "复制本机执行命令"}</button>
-          <span className="text-xs text-slate-500">{commands ? `${commands.split("\\n").length} 个商品` : "等待输入链接"}</span>
-        </div>
-        {commands && <pre className="mt-4 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-4 text-xs leading-6 text-slate-100">{commands}</pre>}
-      </section>
-      <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5">
-        <h2 className="font-semibold">第一次使用</h2>
-        <ol className="mt-3 list-decimal space-y-2 pl-5 text-sm text-slate-600">
-          <li>在 Windows 安装 Node.js 及 Chrome 或 Edge。</li>
-          <li>下载仓库 <code>public/agent</code> 目录中的文件到同一个文件夹，运行 <code>npm install</code>。</li>
-          <li>运行 <code>node agent.mjs login</code>，在弹出的浏览器里登录 1688 和拼多多商家后台。</li>
-          <li>复制上面的命令到该文件夹的 PowerShell 执行。首次先选“分析并填表”，人工核对后再提交。</li>
-        </ol>
-        <p className="mt-4 text-xs text-slate-500">浏览器登录态只留在本机的 chrome-profile 目录。不要把该目录上传到 GitHub。</p>
-      </section>
-      <section className="mt-6 rounded-2xl bg-slate-100 p-5 text-sm text-slate-600">
-        <h2 className="font-semibold text-slate-900">当前开发范围</h2>
-        <p className="mt-2">只做 1688 商品读取、SKU 定价与风险判断、拼多多表单填写。云端任务队列、数据库、账号体系、Token、订单采购、推广和客服暂不开发。</p>
-      </section>
-    </main>
-  );
+  const counts={running:jobs.filter(j=>["running","queued"].includes(j.status)).length,done:jobs.filter(j=>["eligible","filled","published"].includes(j.status)).length,blocked:jobs.filter(j=>["rejected","failed"].includes(j.status)).length};
+  return <main className="mx-auto max-w-5xl px-4 py-8">
+    <header className="mb-6 flex flex-wrap items-center gap-3">
+      <div><div className="text-sm font-medium text-blue-700">PXX · 第一阶段</div><h1 className="text-2xl font-bold">1688 商品分析 → 拼多多上架</h1><p className="mt-1 text-sm text-slate-500">网页直接连接本机 Agent，浏览器登录态保留在你的电脑。</p></div>
+      <div className={`ml-auto rounded-full px-4 py-2 text-sm font-medium ${online?"bg-emerald-100 text-emerald-800":"bg-red-100 text-red-700"}`}>{online?"● Agent 在线 · "+host:"● Agent 未连接"}</div>
+    </header>
+    {!online&&<div className="mb-5 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">请先在电脑上启动一次本机 Agent（安装目录里的 <b>start-agent.bat</b>）。启动后此处会自动变成在线，不需要复制商品命令。</div>}
+    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <h2 className="font-semibold">添加 1688 商品链接</h2><p className="mt-1 text-sm text-slate-500">支持一次粘贴多个链接，每行一个。</p>
+      <textarea value={urls} onChange={e=>setUrls(e.target.value)} rows={4} placeholder="https://detail.1688.com/offer/123456789012.html" className="mt-3 w-full rounded-lg border border-slate-300 p-3 font-mono text-sm"/>
+      <div className="mt-3 grid gap-2 md:grid-cols-3">{MODES.map(m=><label key={m.v} className={`cursor-pointer rounded-lg border p-3 text-sm ${mode===m.v?"border-blue-500 bg-blue-50":"border-slate-200"}`}><input type="radio" className="mr-2" checked={mode===m.v} onChange={()=>setMode(m.v)}/><b>{m.t}</b><div className="mt-1 text-xs text-slate-500">{m.d}</div></label>)}</div>
+      <div className="mt-3 flex items-center gap-3"><button disabled={!online||!urls.trim()||busy} onClick={submit} className="rounded-lg bg-slate-900 px-5 py-2 text-sm font-medium text-white disabled:opacity-40">{busy?"提交中…":"开始处理"}</button>{error&&<span className="text-sm text-red-600">{error}</span>}</div>
+    </section>
+    <section className="mt-6">
+      <div className="mb-3 flex flex-wrap gap-4 text-sm text-slate-500"><b className="text-slate-900">任务记录（{jobs.length}）</b><span>处理中 {counts.running}</span><span>已完成/待确认 {counts.done}</span><span>异常/拦截 {counts.blocked}</span></div>
+      {!jobs.length?<div className="rounded-xl border border-dashed border-slate-300 p-10 text-center text-sm text-slate-500">还没有任务，粘贴 1688 链接即可开始。</div>:<div className="space-y-3">{jobs.map(j=><article key={j.id} className="rounded-xl border border-slate-200 bg-white p-4">
+        <div className="flex flex-wrap items-center gap-2"><b>{j.title||"1688 商品 "+j.offerId}</b><span className="rounded bg-slate-100 px-2 py-1 text-xs">{j.status}</span><span className="ml-auto text-xs text-slate-500">{j.stage}</span></div>
+        <div className="mt-1 text-xs text-slate-500">商品 ID：{j.offerId} · {j.mode==="check"?"只分析":j.mode==="publish"?"自动提交":"填写待确认"}</div>
+        {j.pddTitle&&<p className="mt-2 text-sm">拼多多标题：{j.pddTitle}</p>}
+        {j.pricing?.skus?.length?<div className="mt-3 overflow-x-auto"><table className="w-full text-left text-xs"><thead><tr className="text-slate-500"><th className="p-2">SKU</th><th>成本</th><th>拼单价</th><th>单买价</th><th>预计利润</th></tr></thead><tbody>{j.pricing.skus.slice(0,20).map((s,i)=><tr key={i} className="border-t"><td className="p-2">{s.name}</td><td>¥{s.cost}</td><td>¥{s.group}</td><td>¥{s.single}</td><td>¥{s.profit}</td></tr>)}</tbody></table></div>:null}
+        {j.reasons?.map((x,i)=><p key={i} className={`mt-1 text-xs ${x.level==="block"?"text-red-600":x.level==="warn"?"text-amber-700":"text-slate-500"}`}>{x.msg}</p>)}
+        {j.error&&<p className="mt-2 whitespace-pre-wrap text-xs text-red-600">{j.error}</p>}
+        <details className="mt-3"><summary className="cursor-pointer text-xs text-slate-500">查看执行日志（{j.logs?.length||0}）</summary><div className="mt-2 max-h-48 overflow-auto rounded bg-slate-950 p-3 font-mono text-xs text-slate-100">{(j.logs||[]).map((l,i)=><div key={i}>{new Date(l.t).toLocaleTimeString()} {l.m}</div>)}</div></details>
+      </article>)}</div>}
+    </section>
+    <p className="mt-6 text-xs text-slate-400">本机服务仅监听 127.0.0.1:17368；商品页面和登录 Cookie 不会上传到 Vercel。网页需通过 HTTPS 打开。</p>
+  </main>;
 }
