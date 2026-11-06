@@ -7,7 +7,6 @@
  *   node agent.mjs check <1688链接>            只判断能不能上架
  *   node agent.mjs list  <1688链接>            判断 + 在拼多多后台填好表单（停在提交前，等你确认）
  *   node agent.mjs list  <1688链接> --submit   判断 + 填写 + 自动提交上架
- *   node agent.mjs watch --server <网页地址>   接入网页控制台：在网页里贴链接，这里自动处理
  *   node agent.mjs inspect-pdd                打印拼多多发布页的表单结构（用于调试选择器）
  *
  * 通用参数：
@@ -22,10 +21,8 @@ import { chromium } from "playwright-core";
 import { priceSku } from "./pricing.mjs";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import readline from "node:readline/promises";
 
-const VERSION = "1.0.0";
 const MAX_PRICE_MULTIPLE = 3.5;
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -79,25 +76,8 @@ const round2 = (n) => Math.round(n * 100) / 100;
 const uniq = (a) => [...new Set(a)];
 const ts = () => new Date().toLocaleTimeString();
 
-function makeStep(server, jobId) {
-  const post = async (patch) => {
-    if (!server || !jobId) return;
-    try {
-      await fetch(`${server}/api/agent/jobs/${jobId}`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${flags.token || process.env.PDD_AGENT_TOKEN || ""}` },
-        body: JSON.stringify(patch),
-      });
-    } catch (e) {
-      console.error(`[${ts()}] 回报失败: ${e.message}`);
-    }
-  };
-  const step = async (msg, patch = {}) => {
-    console.log(`[${ts()}] ${msg}`);
-    await post({ log: msg, ...patch });
-  };
-  step.report = post;
-  return step;
+function makeStep() {
+  return async (msg) => console.log(`[${ts()}] ${msg}`);
 }
 
 async function waitForHuman(page, isDone, msg, step, timeoutMs = 10 * 60 * 1000) {
@@ -879,7 +859,7 @@ async function main() {
     if (!id) throw new Error("请提供 1688 商品链接或商品 ID，例如：node agent.mjs check https://detail.1688.com/offer/123456789012.html");
     const mode = cmd === "check" ? "check" : flags.submit ? "publish" : "fill";
     const { context, close } = await openBrowser();
-    const step = makeStep(null, null);
+    const step = makeStep();
     const r = await runJob({ context, job: { offerId: id }, cfg: loadLocalConfig(), step, mode });
     printResult(r);
     if (r.status === "filled") {
@@ -890,41 +870,6 @@ async function main() {
     return;
   }
 
-  if (cmd === "watch") {
-    const server = String(flags.server || "").replace(/\/$/, "");
-    if (!server || server === "true") throw new Error("请用 --server 指定网页控制台地址，例如：node agent.mjs watch --server https://xxx.example.com");
-    if (!flags.token && !process.env.PDD_AGENT_TOKEN) throw new Error("缺少 Agent Token：请设置 PDD_AGENT_TOKEN 或传入 --token");
-    const { context } = await openBrowser();
-    let alive = true;
-    context.on("close", () => {
-      alive = false;
-      console.log("浏览器已关闭，agent 退出");
-      process.exit(0);
-    });
-    console.log(`✔ agent 已启动，正在等待网页控制台 ${server} 的任务…（Ctrl+C 退出）`);
-    while (alive) {
-      try {
-        const res = await fetch(`${server}/api/agent/claim`, {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${flags.token || process.env.PDD_AGENT_TOKEN || ""}` },
-          body: JSON.stringify({ host: os.hostname(), version: VERSION }),
-        });
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const { job, config } = await res.json();
-        if (!job) {
-          await sleep(3500);
-          continue;
-        }
-        console.log(`\n▶ 领取任务 #${job.id}  offer ${job.offerId}  模式 ${job.mode}`);
-        const step = makeStep(server, job.id);
-        await runJob({ context, job, cfg: { ...DEFAULTS, ...config }, step, mode: job.mode });
-      } catch (e) {
-        console.error(`[${ts()}] 与控制台通信失败：${e.message}，5 秒后重试`);
-        await sleep(5000);
-      }
-    }
-    return;
-  }
 
   throw new Error(`未知命令 ${cmd}，运行 node agent.mjs help 查看用法`);
 }
