@@ -9,37 +9,20 @@
 3. 不需要配置 Environment Variables。
 4. 后续推送到 `main`，Vercel 自动重新部署。
 
-当前 MVP 目标是不依赖 PostgreSQL、Neon、Supabase、Redis、AUTH_SECRET、AGENT_TOKEN 或 DASHBOARD_PASSWORD。网页不承担云端任务队列；商品浏览器操作由用户本机 Agent 执行。
+当前 MVP 目标是不依赖 PostgreSQL、Neon、Supabase、Redis、AUTH_SECRET、AGENT_TOKEN 或 DASHBOARD_PASSWORD。网页直接连接用户本机 Agent（127.0.0.1），自动检测在线状态、下发任务并显示进度；不使用云端任务队列。
 
 ## 本机 Agent（Windows）
 
-需要 Node.js 18+ 和 Chrome 或 Edge。下载 `public/agent` 目录中的四个文件到同一目录：
-
-- `agent.mjs`
-- `package.json`
-- `pricing.mjs`
-- `pricing.test.mjs`
-
-PowerShell：
+首次下载 `public/agent` 中的 `agent.mjs`、`package.json`、`pricing.mjs`、`pricing.test.mjs` 和 `start-agent.bat` 到同一目录。安装 Node.js 18+、Chrome 或 Edge 后，首次运行：
 
 ```powershell
 npm install
-npm test
 node agent.mjs login
 ```
 
-在弹出的独立浏览器里登录 1688 和拼多多商家后台。然后执行：
+登录 1688 和拼多多后，以后双击 `start-agent.bat` 启动本机 Agent。打开 HTTPS 网页，等右上角显示在线，直接粘贴 1688 链接开始处理。网页显示任务状态、SKU 定价、风险判断和执行日志。
 
-```powershell
-node agent.mjs check "https://detail.1688.com/offer/123456789012.html"
-node agent.mjs list "https://detail.1688.com/offer/123456789012.html"
-```
-
-- `check`：只分析商品。
-- `list`：分析并填写拼多多表单，停在提交前。
-- `list --submit`：提交上架。前期先不要批量自动提交。
-
-登录态和 `chrome-profile` 目录只保存在本机，严禁提交到 GitHub 或上传到云端。
+本机 Agent 只监听 `127.0.0.1:17368`，不经过云端队列。浏览器登录态保存在本机 `chrome-profile`，严禁上传。
 
 ## 定价规则
 
