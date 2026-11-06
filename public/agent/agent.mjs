@@ -663,7 +663,8 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
   const isCategoryUrl = (url) => {
     try {
       const x = new URL(url);
-      return x.hostname === "mms.pinduoduo.com" && x.pathname.replace(/\\/+$/, "") === "/goods/category";
+      const pathname = x.pathname.endsWith("/") ? x.pathname.slice(0, -1) : x.pathname;
+      return x.hostname === "mms.pinduoduo.com" && pathname === "/goods/category";
     } catch { return false; }
   };
   if (!isCategoryUrl(page.url())) {
