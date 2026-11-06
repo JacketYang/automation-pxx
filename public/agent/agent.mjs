@@ -402,7 +402,7 @@ function evaluate(p, cfg) {
   const minProfit = Math.min(...skuPricing.map((s) => s.profit));
   const worst = Math.max(...skuPricing.map((s) => s.group / Math.max(s.landedCost, 0.01)));
   if (p.cost > 0 && worst > MAX_PRICE_MULTIPLE)
-    add("block", "low_margin", \`含运费到岸成本下，目标利润售价需要达到成本的 \${round2(worst)} 倍（上限 \${MAX_PRICE_MULTIPLE} 倍），建议先对比同规格市场价\`);
+    add("block", "low_margin", `含运费到岸成本下，目标利润售价需要达到成本的 ${round2(worst)} 倍（上限 ${MAX_PRICE_MULTIPLE} 倍），建议先对比同规格市场价`);
   const pricing = {
     skus: skuPricing,
     minProfit: round2(minProfit),
