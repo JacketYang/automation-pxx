@@ -721,7 +721,7 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
         parentText: (el.parentElement?.parentElement?.innerText || el.parentElement?.innerText || "").trim().slice(0, 100),
       })).catch(() => ({ accept: "", multiple: false, visible: false, parentText: "" }));
       inputInfo.push(info);
-      if (!info.accept || /image|\\.jpg|\\.jpeg|\\.png|\\.webp/i.test(info.accept)) candidates.push(i);
+      if (!info.accept || /image/i.test(info.accept)) candidates.push(i);
     }
     if (!candidates.length) {
       throw new Error(`类目页没有可用于图片的上传控件；inputs=${JSON.stringify(inputInfo)}`);
