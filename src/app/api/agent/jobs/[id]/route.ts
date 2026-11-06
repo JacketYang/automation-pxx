@@ -1,50 +1,5 @@
-import { db } from "@/db";
-import { jobs, type JobStatus, type Reason } from "@/db/schema";
-import { touchAgent } from "@/lib/config";
-import { eq } from "drizzle-orm";
-
-export const dynamic = "force-dynamic";
-
-type Patch = {
-  status?: JobStatus;
-  stage?: string;
-  title?: string;
-  pddTitle?: string;
-  verdict?: "ok" | "warn" | "blocked" | "";
-  reasons?: Reason[];
-  product?: Record<string, unknown> | null;
-  pricing?: Record<string, unknown> | null;
-  pddGoodsId?: string;
-  error?: string;
-  log?: string;
-};
-
-const STATUSES = ["queued", "running", "rejected", "eligible", "filled", "published", "failed"];
-
-/** agent 回报进度 / 结果 */
-export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
-  const { id } = await ctx.params;
-  const jobId = Number(id);
-  const p = (await req.json().catch(() => ({}))) as Patch;
-  await touchAgent({});
-
-  const [row] = await db.select().from(jobs).where(eq(jobs.id, jobId));
-  if (!row) return Response.json({ error: "not found" }, { status: 404 });
-
-  const set: Partial<typeof jobs.$inferInsert> = { updatedAt: new Date() };
-  if (p.status && STATUSES.includes(p.status)) set.status = p.status;
-  if (typeof p.stage === "string") set.stage = p.stage.slice(0, 300);
-  if (typeof p.title === "string") set.title = p.title.slice(0, 500);
-  if (typeof p.pddTitle === "string") set.pddTitle = p.pddTitle.slice(0, 200);
-  if (p.verdict !== undefined) set.verdict = p.verdict;
-  if (Array.isArray(p.reasons)) set.reasons = p.reasons;
-  if (p.product !== undefined) set.product = p.product;
-  if (p.pricing !== undefined) set.pricing = p.pricing;
-  if (typeof p.pddGoodsId === "string") set.pddGoodsId = p.pddGoodsId;
-  if (typeof p.error === "string") set.error = p.error.slice(0, 2000);
-  if (typeof p.log === "string" && p.log) {
-    set.logs = [...row.logs, { t: new Date().toISOString(), m: p.log.slice(0, 600) }].slice(-300);
-  }
-  await db.update(jobs).set(set).where(eq(jobs.id, jobId));
-  return Response.json({ ok: true });
-}
+import {db} from "@/db";import {jobs,type JobStatus,type Reason} from "@/db/schema";import {touchAgent} from "@/lib/config";import {agentAuth} from "@/lib/auth";import {eq} from "drizzle-orm";
+export const dynamic="force-dynamic";
+type Patch={status?:JobStatus;stage?:string;title?:string;pddTitle?:string;verdict?:"ok"|"warn"|"blocked"|"";reasons?:Reason[];product?:Record<string,unknown>|null;pricing?:Record<string,unknown>|null;pddGoodsId?:string;error?:string;log?:string};
+const STATUSES=["queued","running","rejected","eligible","filled","published","failed"];
+export async function POST(req:Request,ctx:{params:Promise<{id:string}>}){const denied=agentAuth(req);if(denied)return denied;const {id}=await ctx.params;const jobId=Number(id);if(!Number.isSafeInteger(jobId)||jobId<=0)return Response.json({error:"任务 ID 无效"},{status:400});const p=(await req.json().catch(()=>({}))) as Patch;await touchAgent({});const [row]=await db.select().from(jobs).where(eq(jobs.id,jobId));if(!row)return Response.json({error:"任务不存在"},{status:404});const set:Partial<typeof jobs.$inferInsert>={updatedAt:new Date()};if(p.status&&STATUSES.includes(p.status))set.status=p.status;if(typeof p.stage==="string")set.stage=p.stage.slice(0,300);if(typeof p.title==="string")set.title=p.title.slice(0,500);if(typeof p.pddTitle==="string")set.pddTitle=p.pddTitle.slice(0,200);if(p.verdict!==undefined)set.verdict=p.verdict;if(Array.isArray(p.reasons))set.reasons=p.reasons;if(p.product!==undefined)set.product=p.product;if(p.pricing!==undefined)set.pricing=p.pricing;if(typeof p.pddGoodsId==="string")set.pddGoodsId=p.pddGoodsId;if(typeof p.error==="string")set.error=p.error.slice(0,2000);if(typeof p.log==="string"&&p.log)set.logs=[...row.logs,{t:new Date().toISOString(),m:p.log.slice(0,600)}].slice(-300);await db.update(jobs).set(set).where(eq(jobs.id,jobId));return Response.json({ok:true});}

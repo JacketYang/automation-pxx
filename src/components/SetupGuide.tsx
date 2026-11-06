@@ -79,10 +79,10 @@ npm install`;
       <div>
         <div className="mb-2 flex items-center gap-2">
           <span className="rounded-full bg-slate-900 px-2 py-0.5 text-xs text-white">3</span>
-          <strong>启动 agent，连接本控制台</strong>（保持窗口开着）
+          <strong>设置 Agent Token 并启动 agent，连接本控制台</strong>（保持窗口开着）
         </div>
-        <Code>{`node agent.mjs watch --server ${origin}`}</Code>
-        <p className="mt-1 text-xs text-slate-500">连上后页面右上角会变成「Agent 在线」，然后在上面贴 1688 链接即可。</p>
+        <Code>{os === "win" ? `$env:PDD_AGENT_TOKEN = "粘贴 Vercel 中的 AGENT_TOKEN"\nnode agent.mjs watch --server ${origin} --token $env:PDD_AGENT_TOKEN` : `export PDD_AGENT_TOKEN="粘贴 Vercel 中的 AGENT_TOKEN"\nnode agent.mjs watch --server ${origin} --token $PDD_AGENT_TOKEN`}</Code>
+        <p className="mt-1 text-xs text-slate-500">先在 Vercel 环境变量中设置 AGENT_TOKEN，并在此处填入同一个值。连上后页面右上角会变成「Agent 在线」，然后在上面贴 1688 链接即可。</p>
       </div>
 
       <div className="rounded-lg bg-amber-50 p-3 text-xs leading-relaxed text-amber-900">

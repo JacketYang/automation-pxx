@@ -84,7 +84,7 @@ function makeStep(server, jobId) {
     try {
       await fetch(`${server}/api/agent/jobs/${jobId}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization: `Bearer ${flags.token || process.env.PDD_AGENT_TOKEN || ""}` },
         body: JSON.stringify(patch),
       });
     } catch (e) {
@@ -875,6 +875,7 @@ async function main() {
   if (cmd === "watch") {
     const server = String(flags.server || "").replace(/\/$/, "");
     if (!server || server === "true") throw new Error("请用 --server 指定网页控制台地址，例如：node agent.mjs watch --server https://xxx.example.com");
+    if (!flags.token && !process.env.PDD_AGENT_TOKEN) throw new Error("缺少 Agent Token：请设置 PDD_AGENT_TOKEN 或传入 --token");
     const { context } = await openBrowser();
     let alive = true;
     context.on("close", () => {
@@ -887,7 +888,7 @@ async function main() {
       try {
         const res = await fetch(`${server}/api/agent/claim`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", authorization: `Bearer ${flags.token || process.env.PDD_AGENT_TOKEN || ""}` },
           body: JSON.stringify({ host: os.hostname(), version: VERSION }),
         });
         if (!res.ok) throw new Error("HTTP " + res.status);
