@@ -28,14 +28,19 @@ export default function Dashboard() {
   const [savingSettings,setSavingSettings]=useState(false);
   const load=useCallback(async()=>{
     try {
-      const [h,j,s]=await Promise.all([fetch(API+"/health",{cache:"no-store"}),fetch(API+"/jobs",{cache:"no-store"}),fetch(API+"/settings",{cache:"no-store"})]);
-      if(!h.ok||!j.ok||!s.ok) throw new Error("Agent 未响应");
-      const health=await h.json(); const data=await j.json(); const settings=await s.json();
-      setOnline(Boolean(health.online)); setHost(health.host||"本机"); setJobs(data.jobs||[]);
-      setMinProfit(String(settings.minProfit ?? 3)); setTargetRoi(String(settings.targetRoi ?? 2)); setError("");
+      const [h,j]=await Promise.all([fetch(API+"/health",{cache:"no-store"}),fetch(API+"/jobs",{cache:"no-store"})]);
+      if(!h.ok||!j.ok) throw new Error("Agent 未响应");
+      const health=await h.json(); const data=await j.json();
+      setOnline(Boolean(health.online)); setHost(health.host||"本机"); setJobs(data.jobs||[]); setError("");
     } catch { setOnline(false); setHost(""); }
   },[]);
   useEffect(()=>{ load(); const t=window.setInterval(load,1500); return ()=>window.clearInterval(t); },[load]);
+  useEffect(()=>{
+    if(!online) return;
+    fetch(API+"/settings",{cache:"no-store"}).then(r=>r.json()).then(v=>{
+      setMinProfit(String(v.minProfit ?? 3)); setTargetRoi(String(v.targetRoi ?? 2));
+    }).catch(()=>{});
+  },[online]);
   async function saveSettings(){
     setSavingSettings(true);setSettingsSaved(false);setError("");
     try {
