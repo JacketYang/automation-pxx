@@ -4,8 +4,8 @@
 
 ## 1. 创建 Neon 数据库
 1. 在 https://neon.tech 创建 PostgreSQL 项目，区域尽量选靠近 Vercel 部署区域的地点。
-2. 复制 Pooled connection string（主机名通常包含 `-pooler`），连接串包含 `sslmode=require`。
-3. 将其保存为 Vercel 环境变量 `DATABASE_URL`。
+2. 复制 Pooled connection string（主机名包含 `-pooler`）作为运行时连接；再复制 Direct connection string（主机名不含 `-pooler`）用于数据库迁移。两者都保留 `sslmode=require`。
+3. 分别保存为 Vercel 环境变量 `DATABASE_URL` 和 `DATABASE_URL_UNPOOLED`。
 
 ## 2. 设置 Vercel 环境变量
 在本地 PowerShell 运行两次以下命令，分别生成 AUTH_SECRET 和 AGENT_TOKEN（两次结果必须不同）：
@@ -13,7 +13,8 @@
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 在 Vercel → Project → Settings → Environment Variables 设置：
-- `DATABASE_URL`：Neon pooled connection string
+- `DATABASE_URL`：Neon pooled connection string（Vercel Functions 运行时）
+- `DATABASE_URL_UNPOOLED`：Neon direct connection string（运行 Drizzle 迁移时使用；可选）
 - `DASHBOARD_PASSWORD`：你自己设置的长随机工作台密码
 - `AUTH_SECRET`：第一条命令生成的随机值（至少 32 字符）
 - `AGENT_TOKEN`：第二条命令生成的另一个随机值
@@ -22,10 +23,10 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 ## 3. 部署
 在 Vercel 中 Add New → Project → Import Git Repository，选择 `JacketYang/automation-pxx`。
-部署分支先选 `deploy/vercel-neon-hardening` 进行验证；Framework Preset 选 Next.js，Root Directory 保持仓库根目录。确认四个环境变量已添加后 Deploy。
+部署分支先选 `deploy/vercel-neon-hardening` 进行验证；Framework Preset 选 Next.js，Root Directory 保持仓库根目录。确认四个必需环境变量和可选的 DATABASE_URL_UNPOOLED 已添加后 Deploy。
 
 ## 4. 初始化数据库
-在 Neon 控制台 SQL Editor 中执行仓库文件 `database/schema.sql`。也可以在本地设置好 DATABASE_URL 后运行 `npm install`、`npm run db:push`。
+在 Neon 控制台 SQL Editor 中执行仓库文件 `database/schema.sql`。也可以在本地设置好 DATABASE_URL_UNPOOLED 后运行 `npm install`、`npm run db:push`。Drizzle 迁移优先使用直连，Vercel 运行时继续使用 pooled DATABASE_URL。
 
 ## 5. Windows 本机 Agent
 在新目录下载 agent（不要覆盖旧的 profile）：
