@@ -995,18 +995,36 @@ async function main() {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     await rl.question("请在浏览器里选好类目，进入“商品发布表单”页面，然后按回车 ");
     rl.close();
-    const target = context.pages().find((p) => isFormUrl(p.url())) || page;
-    const info = await target.evaluate(() => ({
-      url: location.href,
-      labels: [...document.querySelectorAll("label,[class*=label],[class*=Label]")].map((e) => (e.innerText || "").trim()).filter((t) => t && t.length < 30),
-      inputs: [...document.querySelectorAll("input,textarea,select")].map((e) => ({ tag: e.tagName, type: e.type, placeholder: e.placeholder, name: e.name, cls: e.className, visible: e.getClientRects().length > 0 })),
-      buttons: [...document.querySelectorAll("button,[role=button]")].map((e) => (e.innerText || "").trim()).filter(Boolean),
-      tables: [...document.querySelectorAll("table")].map((t) => [...t.querySelectorAll("thead th, thead td")].map((x) => x.innerText.trim())),
-    }));
+    const pages = context.pages();
+    const info = { capturedAt: new Date().toISOString(), pages: [] };
+    for (const p of pages) {
+      const pageInfo = { url: p.url(), frames: [] };
+      for (const frame of p.frames()) {
+        const frameInfo = await frame.evaluate(() => {
+          const visible = (e) => !!e.getClientRects().length;
+          const text = (e) => (e.innerText || e.getAttribute("aria-label") || e.getAttribute("title") || "").trim().slice(0, 160);
+          return {
+            url: location.href,
+            title: document.title,
+            labels: [...document.querySelectorAll("label,[class*=label],[class*=Label]")].map(text).filter((t) => t && t.length < 80).slice(0, 300),
+            inputs: [...document.querySelectorAll("input,textarea,select")].map((e) => ({
+              tag: e.tagName, type: e.type || "", placeholder: e.getAttribute("placeholder") || "",
+              name: e.getAttribute("name") || "", cls: typeof e.className === "string" ? e.className : "",
+              ariaLabel: e.getAttribute("aria-label") || "", visible: visible(e),
+              // 不读取 value，避免把用户输入、密码或验证码写入诊断文件。
+            })).slice(0, 500),
+            buttons: [...document.querySelectorAll("button,[role=button]")].map(text).filter(Boolean).slice(0, 300),
+            tables: [...document.querySelectorAll("table")].map((t) => [...t.querySelectorAll("thead th,thead td,tr:first-child th,tr:first-child td")].map(text)).slice(0, 100),
+            shadowRoots: [...document.querySelectorAll("*")].filter((e) => e.shadowRoot).length,
+          };
+        }).catch((e) => ({ url: frame.url(), error: e.message }));
+        pageInfo.frames.push(frameInfo);
+      }
+      info.pages.push(pageInfo);
+    }
     fs.mkdirSync(OUT, { recursive: true });
-    fs.writeFileSync(path.join(OUT, "pdd-form.json"), JSON.stringify(info, null, 2));
-    await target.screenshot({ path: path.join(OUT, "pdd-form.png"), fullPage: true });
-    console.log(`已保存 ${path.join(OUT, "pdd-form.json")} 和 pdd-form.png`);
+    fs.writeFileSync(path.join(OUT, "pdd-form.json"), JSON.stringify(info, null, 2), "utf8");
+    console.log(`已保存 ${path.join(OUT, "pdd-form.json")}（包含所有打开页面及 iframe；未生成截图）`);
     await close();
     return;
   }
