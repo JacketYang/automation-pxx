@@ -62,7 +62,7 @@ const DEFAULTS = {
   shippingTemplate: "",
   categoryHint: "",
   allowWarn: true,
-  requireDropship: true,
+  requireDropship: false,
   bannedKeywords: ["香烟", "电子烟", "处方药", "药品", "成人用品", "情趣", "仿真枪", "管制刀具", "匕首", "医疗器械", "美瞳", "烟花", "高仿", "仿牌"],
   brandKeywords: ["耐克", "nike", "阿迪达斯", "adidas", "苹果", "iphone", "华为", "小米", "路易威登", "gucci", "chanel", "迪奥", "爱马仕", "迪士尼", "乐高", "lego"],
   warnKeywords: ["食品", "零食", "保健", "化妆", "护肤", "面膜", "婴儿", "玩具", "充电", "电池", "插座", "电器", "灯"],
@@ -377,13 +377,13 @@ function evaluate(p, cfg) {
   if (p.gallery.length === 0) add("block", "no_images", "没读到商品主图");
   else if (p.gallery.length < 3) add("warn", "few_images", `主图只有 ${p.gallery.length} 张，拼多多要求至少 3 张，会用 SKU 图/详情图补`);
   if (!(p.cost > 0)) add("block", "no_price", "没读到价格");
-  if (p.minOrder && p.minOrder > cfg.maxMinOrder && !p.flags.onePieceDropship) add("block", "min_order", `起批量 ${p.minOrder}，且没有读取到明确的一件代发价格`);
+  if (p.minOrder && p.minOrder > cfg.maxMinOrder && !p.flags.onePieceDropship) add("warn", "min_order", `起批量 ${p.minOrder}，未识别到一件代发标识；先继续流程，发布前请核实能否单件采购`);
 
   const hay = [p.title, ...Object.values(p.attrs || {}), ...p.skus.map((s) => s.name)].join(" ").toLowerCase();
   const bad = cfg.bannedKeywords.filter((k) => hit(hay, k));
   if (bad.length) add("block", "banned", `命中拼多多违禁/禁售词：${bad.join("、")}`);
   const brands = cfg.brandKeywords.filter((k) => hit(hay, k));
-  if (brands.length) add("block", "brand", `含品牌词：${brands.join("、")}（无授权会侵权）`);
+  if (brands.length) add("warn", "brand", `含品牌词：${brands.join("、")}（需确认授权；流程测试阶段先不自动淘汰）`);
   const warns = cfg.warnKeywords.filter((k) => hit(hay, k));
   if (warns.length) add("warn", "qualification", `可能需要类目资质/3C/备案：${warns.join("、")}`);
   const brandAttr = p.attrs?.["品牌"];
@@ -392,10 +392,10 @@ function evaluate(p, cfg) {
 
   if (!p.flags.sevenDay) add("warn", "no_7day", "页面没看到“7天无理由”，拼多多多数类目强制要求");
   if (p.flags.shipHours && p.flags.shipHours > cfg.promiseHours)
-    add("block", "ship_slow", `货源发货时效 ${p.flags.shipHours} 小时，超过你承诺的 ${cfg.promiseHours} 小时`);
-  if (!p.flags.onePieceDropship) add(cfg.requireDropship ? "block" : "warn", "no_dropship", "未识别到明确的“1件价格/一件代发”信息；不能把批发阶梯价当成单件代发成本");
-  if (!(p.onePiecePrice > 0)) add("block", "dropship_price_unknown", "未读取到代发区域明确的 1 件价格；不能使用批发阶梯价或搜索页最低价代替");
-  if (!Number.isFinite(p.flags.shippingCost)) add("block", "shipping_unknown", `未读取到代发区域的包邮或明确运费；当前仅用设置中的 ¥${cfg.shippingCost} 估算，核实实际单件运费后再上架`);
+    add("warn", "ship_slow", `货源发货时效 ${p.flags.shipHours} 小时，超过设置的 ${cfg.promiseHours} 小时；先继续流程，发布前需调整承诺时效`);
+  if (!p.flags.onePieceDropship) add("warn", "no_dropship", "未识别到明确的一件代发标识；先使用读取到的价格估算，发布前请核实单件采购条件");
+  if (!(p.onePiecePrice > 0)) add("warn", "dropship_price_unknown", "未读取到代发区域明确的 1 件价格；暂用可读取的 SKU/商品价格估算，发布前必须核实单件价格");
+  if (!Number.isFinite(p.flags.shippingCost)) add("warn", "shipping_unknown", `未读取到明确运费；暂按本机设置的 ¥${cfg.shippingCost} 估算，发布前请核实实际单件运费`);
   if (p.dims.length > 2) add("warn", "many_dims", `规格维度 ${p.dims.length} 个，拼多多最多 2 个，需手动合并`);
   if (p.skus.length > 50) add("warn", "many_skus", `SKU ${p.skus.length} 个，较多`);
   if (!p.skuRead) add("warn", "sku_unread", "没读到规格明细，按单规格处理（有多规格的话需要手动补）");
@@ -412,7 +412,7 @@ function evaluate(p, cfg) {
   const minProfit = Math.min(...skuPricing.map((s) => s.profit));
   const worst = Math.max(...skuPricing.map((s) => s.group / Math.max(s.landedCost, 0.01)));
   if (p.cost > 0 && worst > MAX_PRICE_MULTIPLE)
-    add("block", "low_margin", `含运费到岸成本下，目标利润售价需要达到成本的 ${round2(worst)} 倍（上限 ${MAX_PRICE_MULTIPLE} 倍），建议先对比同规格市场价`);
+    add("warn", "high_price_multiple", `含运费到岸成本下，目标利润售价需要达到成本的 ${round2(worst)} 倍；超过参考倍数 ${MAX_PRICE_MULTIPLE}，先继续流程，建议人工对比市场价`);
   const pricing = {
     skus: skuPricing,
     minProfit: round2(minProfit),
@@ -794,8 +794,14 @@ async function runJob({ context, job, cfg, step, mode }) {
 }
 
 // ───────────────────────── 命令 ─────────────────────────
+const LOCAL_CONFIG_PATH = path.resolve("pxx-config.json");
+
 function loadLocalConfig() {
   let cfg = { ...DEFAULTS };
+  if (fs.existsSync(LOCAL_CONFIG_PATH)) {
+    try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(LOCAL_CONFIG_PATH, "utf8")) }; }
+    catch (e) { console.warn("本机配置文件读取失败，使用默认配置：", e.message); }
+  }
   if (flags.config) cfg = { ...cfg, ...JSON.parse(fs.readFileSync(flags.config, "utf8")) };
   return cfg;
 }
@@ -874,6 +880,26 @@ async function main() {
       }
       if (req.method === "GET" && req.url === "/jobs") {
         res.writeHead(200); res.end(JSON.stringify({ jobs: jobs.slice().reverse() })); return;
+      }
+      if (req.method === "GET" && req.url === "/settings") {
+        const cfg = loadLocalConfig();
+        res.writeHead(200); res.end(JSON.stringify({ minProfit: cfg.minProfit, targetRoi: cfg.targetRoi, shippingCost: cfg.shippingCost })); return;
+      }
+      if (req.method === "POST" && req.url === "/settings") {
+        let raw = "";
+        for await (const chunk of req) raw += chunk;
+        let body = {};
+        try { body = JSON.parse(raw || "{}"); } catch {}
+        const minProfit = Number(body.minProfit);
+        const targetRoi = Number(body.targetRoi);
+        if (!Number.isFinite(minProfit) || minProfit < 0 || minProfit > 10000 ||
+            !Number.isFinite(targetRoi) || targetRoi <= 1 || targetRoi > 100) {
+          res.writeHead(400); res.end(JSON.stringify({ error: "最低利润需为 0–10000 元，目标 ROI 需大于 1 且不超过 100" })); return;
+        }
+        const current = loadLocalConfig();
+        const next = { ...current, minProfit: round2(minProfit), targetRoi: round2(targetRoi) };
+        fs.writeFileSync(LOCAL_CONFIG_PATH, JSON.stringify(next, null, 2), "utf8");
+        res.writeHead(200); res.end(JSON.stringify({ minProfit: next.minProfit, targetRoi: next.targetRoi })); return;
       }
       if (req.method === "POST" && req.url === "/jobs") {
         let raw = "";
