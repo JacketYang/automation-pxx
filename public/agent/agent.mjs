@@ -751,8 +751,43 @@ async function uploadCategoryCover(page, imagePath, step) {
 
       const button = input.locator("xpath=..");
       const chooserPromise = frame.page().waitForEvent("filechooser", { timeout: 10000 });
+      // click 失败或有多个候选时，这个 promise 可能永远走不到 await。
+      // 无 handler 的 rejection 会打死整个 Agent 进程（Node v15+ 默认 throw），
+      // 连 HTTP 服务、任务状态和诊断日志一起消失。
+      chooserPromise.catch(() => {});
       await button.click({ timeout: 10000 });
-      const chooser = await chooserPromise;
+      let chooser;
+      try {
+        chooser = await chooserPromise;
+      } catch (e) {
+        // filechooser 不触发多半不是选择器问题：按钮可能没走 <input type=file>，
+        // 而是用 File System Access API 打开选择器，那条路径不会触发本事件。
+        const probe = await frame.evaluate(() => ({
+          hasShowOpenFilePicker: typeof window.showOpenFilePicker === "function",
+          fileInputCount: document.querySelectorAll('input[type="file"]').length,
+          inputs: [...document.querySelectorAll('input[type="file"]')].slice(0, 5).map((el) => ({
+            accept: el.getAttribute("accept") || "",
+            cls: String(el.className || "").slice(0, 90),
+            parentTag: el.parentElement?.tagName || "",
+            nearestClickable: el.parentElement?.closest("button,[role=button],a")?.tagName || "",
+            display: getComputedStyle(el).display,
+            pointerEvents: getComputedStyle(el).pointerEvents,
+          })),
+          frameCount: window.frames.length,
+          frameUrls: [...Array(window.frames.length)].map((_, i) => window.frames[i]?.location.href.slice(0, 120) || ""),
+        })).catch((x) => ({ probeError: x.message }));
+        // 弹窗/新标签页也会造成同样的现象：filechooser 落在那个 Page 上，
+        // 而我们监听的是当前 input 所属的 Page。
+        let pages = [];
+        try { pages = frame.page().context().pages().map((p) => p.url().slice(0, 140)); } catch { /* ignore */ }
+        throw new Error(
+          `点击“本地上传”后 10 秒内没有收到 filechooser 事件（原始：${e.message.split("\n")[0]}）。` +
+          `若 hasShowOpenFilePicker=true，说明该控件走的是 File System Access API，` +
+          `永远不会触发 filechooser，需要换上传路径而不是换选择器；` +
+          `若 pages 数量在本次点击后增加，说明选择器开在新标签页/弹窗里，当前 Page 收不到该事件。` +
+          `pages=${JSON.stringify(pages)}；探测=${JSON.stringify(probe)}`
+        );
+      }
       await chooser.setFiles(imagePath);
 
       const deadline = Date.now() + 25000;

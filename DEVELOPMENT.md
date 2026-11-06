@@ -266,6 +266,9 @@
 2. **首图真实格式是最高概率根因。** `files.gallery[0]` 无任何格式校验，`downloadImages`（454 行）按响应 `content-type` 保留 `.webp`，UA 写死 Chrome 124，而拼多多首图 input 的 `accept` 只有 `image/jpeg,image/png`。实测：`.png` / `.jpg` 约 0.1 秒通过并把计数推到 `(1/10)`；`.webp` 时 `input.files` 有值、`File.type=image/webp`、组件静默丢弃、计数恒为 `(0/10)`，函数烧满 25 秒后才抛出“轮播图区域没有出现上传计数/预览变化”——**这句报错会把排查精确引向选择器和 DOM，而真因是文件格式**。据此新增 `sniffImageKind()`（读文件头 16 字节判定真实格式，不信扩展名）、`pickCoverImage()`（优先取真实 jpeg/png；全都不合时仍返回首张，让报错说明格式，不静默换图）与 `uploadCategoryCover` 入口的格式闸门（非 jpeg/png 立即抛出真实格式）。
 3. **“点击后 DOM 重建导致验证失败”这一排查方向不成立。** fixture 中强制 React 重建整棵子树后代码仍正确通过，因为持有的是 Locator（每次 `evaluate` 重新解析）而非 ElementHandle。后续无需再投入该方向。
 
+4. **真实页面首轮反馈（同日 22:50）否定了 webp 假设，并暴露一个新的进程级缺陷。** 用户本机日志先输出 `首图格式校验通过：jpeg`——说明该商品首图确实是 jpeg，webp 是真实存在但本轮未命中的隐患，闸门保留。随后崩溃在 `page.waitForEvent: Timeout 10000ms exceeded while waiting for event "filechooser"`，**且整个 Agent 进程直接退出**。原因是 `uploadCategoryCover` 里 `chooserPromise` 在 753 行创建、755 行才 await：只要 `button.click()` 先抛错，或候选项多于一个，这个 promise 就永远走不到 await，它 10 秒后的 rejection 无人处理，Node v15+ 默认按 throw 处理未捕获 rejection，进程连同 HTTP 服务、任务状态和诊断日志一起消失（堆栈特征：`triggerUncaughtException(err, true /* fromPromise */)`）。这解释了"闪退且什么都没输出"。已加 `chooserPromise.catch(() => {})`，本地用最小脚本复现同类崩溃（exit 1，末行未打印）验证机制成立。
+5. **filechooser 不触发不是选择器问题，已改为自动判定。** 新增超时探测并写入错误文本：`hasShowOpenFilePicker`、每个 file input 的 accept/父节点标签/`display`/`pointerEvents`、`frameCount`，以及点击后 `context.pages()` 的 URL 列表。两种可解释该现象且都不需要换选择器的路径：控件走 **File System Access API**（`showOpenFilePicker` 不触发 `filechooser`，必须换上传方式），或选择器开在**新标签页/弹窗**（事件落在别的 Page 上，当前 Page 永远收不到）。fixture 的 `mode=fsa` 与 `mode=overlay` 均如实报告上述字段且进程正常退出（exit 0）。
+
 验证边界：以上全部止于本地 fixture，**真实拼多多页面仍未验证**。判据未变——只有轮播区域计数增长、出现预览或进入已上传状态才算成功，`filechooser` 触发与 `input.files` 有值都不算。待用户在真实页面确认 `output/<任务>/gallery/` 首图后缀及本轮日志后，才能解除“当前阻塞”。
 
 ## 给后续接手者的明确要求
