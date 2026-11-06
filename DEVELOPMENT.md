@@ -80,3 +80,189 @@
 - 诊断数据不得包含 Cookie、Authorization、密码、验证码或其他会话凭据；上传诊断文件前应检查并脱敏。
 - 选择器应集中管理；兼容 iframe、动态弹窗及 Shadow DOM（仅在真实页面确认存在时实现），识别失败时输出明确错误和 JSON 诊断文件。
 - 修复后至少用真实登录页面验证表单节点识别、字段填写和 SKU 填写；默认仍停在最终提交前供人工检查。
+
+---
+
+# 开发交接记录（2026-11-06）
+
+> 本节记录当前真实开发状态，供后续开发者/工具接手。记录中的“已提交”只代表代码已推送 GitHub，不代表已经在用户本机或拼多多真实页面验证通过。
+
+## 项目当前目标与用户工作方式
+
+- 项目：`JacketYang/automation-pxx`，主分支：`main`。
+- 目标闭环：1688 商品分析 → SKU 成本/利润核算 → 拼多多发布表单填写 → 停在最终提交前人工确认。
+- 用户希望直接修改并推送 GitHub，不要反复询问是否提交，不要只提供方案或让用户手工拼接代码。
+- 用户本机没有完整 clone 整个仓库。每次修改本地 Agent 时，必须明确指出要替换的**单个具体文件**，不能笼统要求更新整个仓库。
+- 用户本机 Agent 目录：`D:\ISO\pxx\pdd-agent`；本地文件名：`agent.mjs`。本机服务端口：`17368`。
+- 交流要求：中文、直接、少废话；不要虚报“已修复/已验证”。用户对无依据的小步试错和偏离当前故障的修改非常反感，后续接手应先阅读本记录及相关代码，再集中处理问题。
+
+## 当前仓库关键文件
+
+- `public/agent/agent.mjs`：本机 Playwright Agent，1688 采集、拼多多登录检测、类目页和详情页操作、SKU 表单填写、本机 HTTP 服务。
+- `public/agent/pricing.mjs`：独立 SKU 定价逻辑。
+- `public/agent/pricing.test.mjs`：定价测试。
+- `public/agent/start-agent.bat`：Windows 启动脚本。
+- `DEVELOPMENT.md`：开发约束和本交接记录。
+- `README.md`：部署与 Agent 使用说明。
+
+## 已完成并保留的主要逻辑
+
+### 本机 Agent 与网页连接
+
+- Agent 本机监听 `127.0.0.1:17368`，提供 `/health`、`/jobs`、`/settings` 和 `POST /jobs`。
+- 网页直接检测本机 Agent、发送任务并展示任务状态/日志，不使用云端任务队列。
+- Agent 以 Playwright persistent profile 启动 Chrome/Edge，登录态保存在本机 `chrome-profile`。
+- 首次通过 `node agent.mjs login` 登录 1688 和拼多多；不能假设会继承用户日常浏览器的登录态。
+- `start-agent.bat` 已改为优先使用用户目录下的便携 Node 路径，并用 `cmd /k` 保留启动错误窗口。该脚本仍需在用户实际机器验证。
+
+### 1688 分析与定价约束
+
+- 保留逐 SKU 核算，不得把批发阶梯价当作一件代发价。
+- 核心利润约束：`P × (1 - f - s - 1/R) - C ≥ G`。
+  - P：拼单售价；f：平台费率；s：售后损耗；R：目标 ROI。
+  - C：商品成本、单件运费及其他单笔成本；G：目标经营利润。
+- 默认参数：平台费率 0.6%、售后损耗 3%、目标 ROI 2、目标利润 ¥3。
+- 没有明确的一件代发价、单件运费或单件包邮证据时，必须阻止真实自动发布，不得推测补值。
+- 禁售词、下架、缺标题/图片/价格、确认零库存等硬拦截不得随意放宽。
+- 品牌、发货时效、一件代发识别等风险可按既定 warning 规则处理，不可擅自删除核心校验。
+
+### 拼多多页面流程
+
+1. 类目页：`https://mms.pinduoduo.com/goods/category`
+   - 上传商品首图。
+   - 填商品标题（页面实际 placeholder 曾观察到“商品标题组成：商品描述+规格，最多输入30个汉字（60个字符）”）。
+   - 标题失焦后由拼多多自动识别/推荐类目。
+   - 点击“下一步，完善商品信息”进入详情表单。
+2. 详情页 URL 路径：`/goods/goods_add/index`
+   - 商品轮播图、辅助图、商品属性、详情图、规格、SKU 价格库存、发货承诺、运费模板等。
+   - SKU 表格需要按真实规格行逐行匹配，不得假定只有一个 SKU。
+   - 最终默认停在“提交并上架”之前，人工检查后再提交。
+
+### 表单诊断
+
+- `inspect-pdd` 输出 JSON 诊断，遍历页面及 frames，包含 URL、标签、输入框、按钮、表格和 tableDetails。
+- 诊断不读取 input.value，避免输出用户输入、密码或验证码。
+- 选择器修复应基于真实 DOM 证据，不要凭猜测反复改 selector。
+- 详情页 SKU 逻辑曾修复无 thead 表格、规格值 placeholder、多规格行映射等问题；这些逻辑不可在修复图片上传时顺带重写。
+
+## 当前阻塞：拼多多类目页首图上传（最高优先级）
+
+### 用户最新提供的真实 DOM 诊断
+
+页面：`https://mms.pinduoduo.com/goods/category`
+
+唯一 file input 的诊断：
+
+```json
+{
+  "index": 0,
+  "accept": "image/jpeg,image/png",
+  "multiple": true,
+  "disabled": false,
+  "visible": false,
+  "id": "",
+  "name": "",
+  "labelText": "",
+  "chain": [
+    {
+      "tag": "INPUT",
+      "cls": "MmsUiUploadPicVideoButton___origin___3-TdF2-163-0",
+      "text": "",
+      "images": 0
+    },
+    {
+      "tag": "BUTTON",
+      "cls": "BTN_outerWrapper_5-194-0 BTN_gray_5-194-0 BTN_small_5-194-0 BTN_outerWrapperBtn_5-194-0",
+      "text": "本地上传",
+      "images": 0
+    },
+    {
+      "tag": "SPAN",
+      "cls": "MmsUiUploadPicVideoButton___fileButton___2b-vY2-163-0",
+      "text": "本地上传",
+      "images": 0
+    },
+    {
+      "tag": "SPAN",
+      "cls": "",
+      "text": "本地上传",
+      "images": 0
+    },
+    {
+      "tag": "SECTION",
+      "cls": "goodsCarousel_btns__22KMn",
+      "text": "图片空间上传本地上传",
+      "images": 0
+    },
+    {
+      "tag": "SECTION",
+      "cls": "goodsCarousel_uploadImgEnter__9UMu8",
+      "text": "上传图片 (0/10)",
+      "images": 0
+    },
+    {
+      "tag": "DIV",
+      "cls": "MaterialModalButton_v2_materialContainer__3ut03",
+      "text": "上传图片 (0/10)",
+      "images": 0
+    }
+  ]
+}
+```
+
+失败记录：
+- Playwright 直接对该隐藏 input 调用 `setInputFiles()` 后，页面读取到的 `input.files` 仍是空数组（count=0/name="" /size=0/type=""）。
+- 旧实现错误地把 `setInputFiles()` 调用不报错当成上传成功，导致日志出现“类目页首图已上传”，实际页面没有图片。
+- 之后增加的预览检测仍未解决根因；不能继续沿用“直接 setInputFiles 隐藏 input”的假设。
+- 真实 DOM 已证明 input 嵌套在“本地上传”按钮内，按钮属于 `goodsCarousel` 图片轮播上传区域。
+
+### 最近推送的上传改动
+
+- `cf38e7b`：开始检查文件绑定和图片预览，避免盲报成功。
+- `fdf9fd2`：引入 `uploadCategoryCover()`。
+- `0552a82`：清理误加的 toast 监听逻辑；用户明确要求不要把问题转移到 toast。
+- `cd428d5`：恢复上传 helper。
+- `44a8486`：收紧上传候选区域筛选。
+- `6a68cf7`：根据真实 DOM 改为点击“本地上传”按钮，监听 Playwright `filechooser`，通过文件选择器 `setFiles(imagePath)` 选择文件。
+- `af03a61`：把上传结果验证区域调整为优先定位 `[class*="goodsCarousel_uploadImgEnter"]`，检查“上传图片 (n/10)”计数变化、区域图片数量变化或上传后的操作状态。
+
+当前最新文件：`public/agent/agent.mjs`，最近一次记录的 GitHub blob SHA：`5c91a15b43f574c00302251598d3685cdb924a96`（提交 `af03a61`）。
+
+### 当前实现的验证边界与下一步
+
+- 新实现大致流程：定位 accept 为图片且位于 `goodsCarousel` 区域的 input → 点击 input 的父级“本地上传”按钮 → 等待页面 `filechooser` 事件 → `chooser.setFiles(imagePath)` → 轮询上传区域计数/图片状态。
+- 该实现是基于用户给出的 DOM 结构做出的针对性改动，**尚未获得用户本机运行结果，也没有在真实拼多多登录页面验证通过**。
+- 不能声称首图上传已经修复；必须等实际运行日志和页面结果确认。
+- 若仍失败，下一步应基于本次点击路径收集必要的真实信息：filechooser 是否触发、触发后 input.files 是否有文件、上传区域计数是否变化、按钮/上传区域 DOM 是否在点击后重建。不要再无差别尝试多个 selector。
+- 需要检查当前点击的父节点确实是可交互的“本地上传”按钮，且 filechooser 监听绑定到正确 page；如有疑问，以真实事件和 DOM 变化为依据修复。
+- 不要增加 toast 监听或把 toast 当成图片上传的替代验证。
+- 上传成功的唯一有效证据应是拼多多轮播图上传区域确实出现新图片/计数增长/可确认的上传完成状态；不能仅以文件选择器事件触发或本地 input.files 有值作为成功。
+
+### 本地同步说明
+
+每次修改 `public/agent/agent.mjs` 后，用户只需替换本地：
+`D:\ISO\pxx\pdd-agent\agent.mjs`
+
+当前 raw 下载地址：
+`https://raw.githubusercontent.com/JacketYang/automation-pxx/main/public/agent/agent.mjs`
+
+替换后必须关闭旧 Agent 进程再重新运行 `start-agent.bat`，否则仍可能运行旧代码。若修改其他本地文件，必须逐个明确列出，不能让用户猜。
+
+## 已知尚未完成事项（不要误报完成）
+
+- 拼多多类目页首图上传：仍未真实验证，是当前阻塞。
+- 点击“下一步”后稳定进入详情页：曾出现点击后仍停留在 `/goods/category`，需与首图真实上传完成状态一起验证。
+- 拼多多详情表单属性自动映射：尚未完整实现，属性值不能凭空猜。
+- 多 SKU 规格/价格/库存填写：已有兼容逻辑，但需要真实页面数据验证。
+- 整体 1688 → 拼多多端到端流程：尚未跑通。
+- Vercel 部署、网页与 Agent 连接、设置读写虽已有实现，不代表本机环境端到端验收完成。
+
+## 给后续接手者的明确要求
+
+1. 先读取本文件、`README.md`、`public/agent/agent.mjs` 和 `public/agent/pricing.mjs`，不要推翻现有架构。
+2. 当前只解决首图上传真实闭环，不重写 toast、登录检测、定价、SKU 或网页架构。
+3. 使用用户给出的真实 DOM 证据；先判断 filechooser 是否触发及上传区域是否发生状态变化，再做最小且完整的修复。
+4. 每次推送前检查 JS 语法（至少执行 `node --check agent.mjs`，并注意文件使用 ES module），有条件时运行定价测试和项目构建。
+5. 清楚区分“代码已提交”“本地已替换”“真实页面已验证”三个状态。
+6. 默认停在最终提交前，任何时候都不得擅自自动发布商品。
+
