@@ -1,35 +1,37 @@
-# 1688 → 拼多多 自动上架 agent
+# 本机 Agent
 
-运行在你自己的电脑上（需要 Node 18+ 和已安装的 Chrome 或 Edge）。
-它会用一个独立的浏览器配置目录（`chrome-profile/`，不会动你平时的 Chrome），所以**你只需要在弹出的窗口里登录一次**。
+Agent 在你的 Windows 电脑运行，使用本机 Chrome/Edge 登录态读取 1688 并操作拼多多商家后台。无需数据库、云端服务、Token 或环境变量。
 
-```bash
-npm install                     # 只装 playwright-core，不下载浏览器
-node agent.mjs login            # 首次：登录 1688 + 拼多多商家后台，然后回终端按回车
+## 安装
 
-# 方式 A：不用网页，直接命令行
-node agent.mjs check https://detail.1688.com/offer/123456789012.html            # 只判断
-node agent.mjs list  https://detail.1688.com/offer/123456789012.html            # 判断 + 填好表单，停在提交前
-node agent.mjs list  https://detail.1688.com/offer/123456789012.html --submit   # 判断 + 填写 + 自动提交
+下载本目录中的 `agent.mjs`、`package.json`、`pricing.mjs`、`pricing.test.mjs`，放在同一目录：
 
-# 方式 B：接网页控制台（在网页里贴链接，批量处理、看日志和判断理由）
-node agent.mjs watch --server https://你的控制台地址
+```powershell
+npm install
+npm test
+node agent.mjs login
 ```
 
-## 遇到验证码 / 掉登录怎么办
-agent 检测到 1688 滑块、1688 或拼多多登录页时会**暂停并提示**，你在弹出的浏览器里手动处理完，它会自动继续。
+在弹出的浏览器中登录 1688 和拼多多商家后台。
 
-## 输出
-`output/<商品ID>/` 下有：`product.json`（采集结果+判断+定价）、`gallery/ sku/ detail/`（下载的图片）、`*-filled.png`（填完表单的截图）、`error.png`（出错截图）。
+## 使用
 
-## 自动填写不准怎么办
-拼多多后台页面会改版，类目不同表单也不同。运行：
-
-```bash
-node agent.mjs inspect-pdd
+```powershell
+node agent.mjs check "1688商品链接"
+node agent.mjs list "1688商品链接"
+node agent.mjs list "1688商品链接" --submit
 ```
 
-按提示手动进到发布表单页，会生成 `output/pdd-form.json` 和 `pdd-form.png`，把这两个文件和出错的 `error.png` 发出来即可调整选择器。
+- `check`：只判断商品能否上架并分析价格。
+- `list`：判断并填写拼多多表单，停在最终提交前。
+- `list --submit`：提交发布；初期建议人工检查后提交。
 
-## 常用参数
-`--profile <目录>` `--cdp [http://127.0.0.1:9222]`（连已打开的 Chrome）`--channel chrome|msedge` `--category <类目词>` `--config rules.json`（覆盖加价/违禁词等）`--out <目录>`
+## 定价
+
+默认平台费率 0.6%、售后损耗 3%、目标 ROI 2、目标经营利润 ¥3。逐 SKU 使用公式：
+
+`售价 × (1 - 平台费率 - 售后损耗率 - 1/目标 ROI) - 商品成本 - 单件运费 - 其他成本 ≥ 目标利润`
+
+必须有明确的一件代发价和单件运费/包邮证据；否则不自动上架。参数是经营估算，应按店铺实际账单校准。
+
+登录态只保存在本机 `chrome-profile`，不要分享或上传。
