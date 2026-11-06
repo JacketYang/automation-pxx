@@ -553,9 +553,11 @@ async function fillSkuTable(page, pricing) {
       const row = rows.nth(r);
       const text = await row.innerText().catch(() => "");
       if (/拼单价|团购价/.test(text) && /单买价/.test(text)) continue;
-      const sku = pricing.skus.length === 1
+      let sku = pricing.skus.length === 1
         ? pricing.skus[0]
         : pricing.skus.find((s) => s.attrs?.length && s.attrs.every((a) => text.includes(a)));
+      // 拼多多 SKU 行有时只显示“已启用”，不展示规格文本；仅当行数与源 SKU 数完全一致时按行序对应。
+      if (!sku && rc === pricing.skus.length) sku = pricing.skus[r];
       if (!sku) continue;
       const cells = row.locator("td");
       const setCell = async (i, val) => {
