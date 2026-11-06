@@ -62,7 +62,7 @@ export default function JobCard({ job, onChange }: { job: Job; onChange: () => v
             {!active && job.stage && <span className="mr-2">{job.stage}</span>}
             {job.pricing && (
               <span>
-                建议拼单价 ¥{job.pricing.maxGroup} · 最低利润 ¥{job.pricing.minProfit}
+                建议拼单价 ¥{job.pricing.maxGroup} · 预计经营利润 ¥{job.pricing.minProfit}
               </span>
             )}
             {job.pddGoodsId && <span className="ml-2">商品ID {job.pddGoodsId}</span>}
@@ -98,16 +98,19 @@ export default function JobCard({ job, onChange }: { job: Job; onChange: () => v
 
           {job.pricing && (
             <div className="overflow-x-auto">
-              <div className="mb-1 text-xs text-slate-500">建议定价（元）</div>
-              <table className="w-full min-w-[480px] text-left text-xs">
+              <div className="mb-1 text-xs text-slate-500">建议定价与预计利润（元）</div>
+              {job.pricing.assumptions && <div className="mb-2 text-[11px] text-slate-500">按投产比 {job.pricing.assumptions.targetRoi}、平台费率 {job.pricing.assumptions.pddFeePercent}%、售后损耗 {job.pricing.assumptions.afterSalesLossPercent}%、每单目标利润 ¥{job.pricing.assumptions.minProfit} 估算；实际费用以店铺账单和真实投放为准。</div>}
+              <table className="w-full min-w-[720px] text-left text-xs">
                 <thead className="text-slate-500">
                   <tr>
                     <th className="py-1 pr-3">规格</th>
-                    <th className="pr-3">成本</th>
+                    <th className="pr-3">到岸成本</th>
                     <th className="pr-3">拼单价</th>
                     <th className="pr-3">单买价</th>
-                    <th className="pr-3">参考价</th>
-                    <th className="pr-3">利润</th>
+                    <th className="pr-3">平台费估</th>
+                    <th className="pr-3">推广费估</th>
+                    <th className="pr-3">售后损耗</th>
+                    <th className="pr-3">预计经营利润</th>
                     <th>库存</th>
                   </tr>
                 </thead>
@@ -115,17 +118,18 @@ export default function JobCard({ job, onChange }: { job: Job; onChange: () => v
                   {job.pricing.skus.slice(0, 30).map((s, i) => (
                     <tr key={i} className="border-t border-slate-100">
                       <td className="py-1 pr-3">{s.name}</td>
-                      <td className="pr-3">{s.cost}</td>
+                      <td className="pr-3">{s.landedCost}</td>
                       <td className="pr-3 font-medium">{s.group}</td>
                       <td className="pr-3">{s.single}</td>
-                      <td className="pr-3">{s.market}</td>
+                      <td className="pr-3">{s.platformFee}</td>
+                      <td className="pr-3">{s.promotionCost}</td>
+                      <td className="pr-3">{s.afterSalesCost}</td>
                       <td className="pr-3">{s.profit}</td>
                       <td>{s.stock}</td>
                     </tr>
                   ))}
                 </tbody>
-              </table>
-            </div>
+              </table>           </div>
           )}
 
           {job.error && <pre className="whitespace-pre-wrap rounded-md bg-red-50 p-3 text-xs text-red-800">{job.error}</pre>}

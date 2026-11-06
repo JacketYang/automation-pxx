@@ -30,10 +30,10 @@ export default function SetupGuide() {
   const download =
     os === "unix"
       ? `mkdir pdd-agent && cd pdd-agent
-curl -O ${origin}/agent/agent.mjs -O ${origin}/agent/package.json
+curl -O ${origin}/agent/agent.mjs -O ${origin}/agent/package.json -O ${origin}/agent/pricing.mjs -O ${origin}/agent/pricing.test.mjs
 npm install`
       : `mkdir pdd-agent; cd pdd-agent
-curl.exe -O ${origin}/agent/agent.mjs -O ${origin}/agent/package.json
+curl.exe -O ${origin}/agent/agent.mjs -O ${origin}/agent/package.json -O ${origin}/agent/pricing.mjs -O ${origin}/agent/pricing.test.mjs
 npm install`;
 
   return (

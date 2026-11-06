@@ -1,35 +1,51 @@
-# 1688 → 拼多多 自动上架 agent
+# 本地 Agent 使用说明
 
-运行在你自己的电脑上（需要 Node 18+ 和已安装的 Chrome 或 Edge）。
-它会用一个独立的浏览器配置目录（`chrome-profile/`，不会动你平时的 Chrome），所以**你只需要在弹出的窗口里登录一次**。
+Agent 在你的 Windows 电脑运行，负责打开 Chrome/Edge、读取 1688 商品并操作拼多多商家后台。浏览器登录态只保存在本机的 `chrome-profile` 目录。
 
-```bash
-npm install                     # 只装 playwright-core，不下载浏览器
-node agent.mjs login            # 首次：登录 1688 + 拼多多商家后台，然后回终端按回车
+## 安装
 
-# 方式 A：不用网页，直接命令行
-node agent.mjs check https://detail.1688.com/offer/123456789012.html            # 只判断
-node agent.mjs list  https://detail.1688.com/offer/123456789012.html            # 判断 + 填好表单，停在提交前
-node agent.mjs list  https://detail.1688.com/offer/123456789012.html --submit   # 判断 + 填写 + 自动提交
+需要 Node.js 18+ 和已安装的 Chrome 或 Edge。下载以下四个文件到同一目录：
 
-# 方式 B：接网页控制台（在网页里贴链接，批量处理、看日志和判断理由）
-node agent.mjs watch --server https://你的控制台地址
+- `agent.mjs`
+- `package.json`
+- `pricing.mjs`
+- `pricing.test.mjs`
+
+然后运行：
+
+```powershell
+npm install
+npm test
+node agent.mjs login
 ```
 
-## 遇到验证码 / 掉登录怎么办
-agent 检测到 1688 滑块、1688 或拼多多登录页时会**暂停并提示**，你在弹出的浏览器里手动处理完，它会自动继续。
+在弹出的独立浏览器窗口中自行登录 1688 和拼多多商家后台。不要向任何人提供密码、验证码或 Cookie。
 
-## 输出
-`output/<商品ID>/` 下有：`product.json`（采集结果+判断+定价）、`gallery/ sku/ detail/`（下载的图片）、`*-filled.png`（填完表单的截图）、`error.png`（出错截图）。
+## 连接 Vercel 工作台
 
-## 自动填写不准怎么办
-拼多多后台页面会改版，类目不同表单也不同。运行：
+先在 Vercel 环境变量设置 `AGENT_TOKEN`，本机使用同一个值：
 
-```bash
-node agent.mjs inspect-pdd
+```powershell
+$env:PDD_AGENT_TOKEN = "你的 AGENT_TOKEN"
+node agent.mjs watch --server https://你的工作台域名 --token $env:PDD_AGENT_TOKEN
 ```
 
-按提示手动进到发布表单页，会生成 `output/pdd-form.json` 和 `pdd-form.png`，把这两个文件和出错的 `error.png` 发出来即可调整选择器。
+保持该终端窗口运行。不要把 Token 或 `chrome-profile` 上传到 GitHub。
 
-## 常用参数
-`--profile <目录>` `--cdp [http://127.0.0.1:9222]`（连已打开的 Chrome）`--channel chrome|msedge` `--category <类目词>` `--config rules.json`（覆盖加价/违禁词等）`--out <目录>`
+## 定价模型（参照 xiaoman 核算表）
+
+默认假设：平台费率 0.6%、售后损耗 3%、目标投产比 2、每单目标经营利润 3 元。对每个 SKU 单独核算，拼单价向上取整到 0.1 元：
+
+`售价 × (1 - 平台费率 - 售后损耗率 - 1/目标投产比) - 商品成本 - 单件运费 - 其他每单成本 ≥ 目标经营利润`
+
+最低加价率只作为售价下限。Agent 只从 1688「代发下单」区域读取明确的 1 件价格；如果没有明确的一件代发价，或没有读取到包邮/实际运费，工作台会阻止自动上架。请先核实具体 SKU、代发下单价、运费、发货时效和拼多多面单支持情况。
+
+平台费率、售后损耗和广告投产比是经营估算，不代表平台最终扣费或实际投放结果；请按店铺账单、广告报表和售后数据调整。
+
+## 常用命令
+
+- `node agent.mjs login`：打开独立浏览器登录
+- `node agent.mjs check <1688链接>`：只判断商品
+- `node agent.mjs list <1688链接>`：填写表单但停在提交前
+- `node agent.mjs list <1688链接> --submit`：提交上架（建议先充分测试）
+- `node agent.mjs watch --server <工作台地址> --token <AGENT_TOKEN>`：连接网页工作台

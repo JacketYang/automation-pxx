@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "login": "node agent.mjs login",
-    "inspect": "node agent.mjs inspect-pdd"
+    "inspect": "node agent.mjs inspect-pdd",
+    "test": "node --test pricing.test.mjs"
   },
   "dependencies": {
     "playwright-core": "^1.49.0"

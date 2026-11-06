@@ -34,6 +34,8 @@ mkdir pdd-agent-cloud
 cd pdd-agent-cloud
 Invoke-WebRequest https://YOUR-VERCEL-DOMAIN/agent/agent.mjs -OutFile agent.mjs
 Invoke-WebRequest https://YOUR-VERCEL-DOMAIN/agent/package.json -OutFile package.json
+Invoke-WebRequest https://YOUR-VERCEL-DOMAIN/agent/pricing.mjs -OutFile pricing.mjs
+Invoke-WebRequest https://YOUR-VERCEL-DOMAIN/agent/pricing.test.mjs -OutFile pricing.test.mjs
 npm install
 node agent.mjs login
 $env:PDD_AGENT_TOKEN = "填入与 Vercel AGENT_TOKEN 相同的值"

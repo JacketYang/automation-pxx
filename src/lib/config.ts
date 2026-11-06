@@ -7,7 +7,9 @@ export type Config = {
   shippingCost: number; // 预估每单快递成本（元）
   fixedCost: number; // 其它固定成本（包装等）
   pddFeePercent: number; // 平台技术服务费 %
-  minProfit: number; // 每单最低利润（元）
+  minProfit: number; // 每单目标经营利润（扣除推广费和售后损耗后，元）
+  targetRoi: number; // 目标投产比（成交额/推广费）
+  afterSalesLossPercent: number; // 售后损耗率 %
   maxMinOrder: number; // 允许的最大起批量（一件代发 = 1）
   singleBuyExtra: number; // 单买价 = 拼单价 + 这个数
   defaultStock: number; // 上架库存（不超过货源库存）
@@ -26,7 +28,9 @@ export const DEFAULT_CONFIG: Config = {
   shippingCost: 2.5,
   fixedCost: 0,
   pddFeePercent: 0.6,
-  minProfit: 2,
+  minProfit: 3,
+  targetRoi: 2,
+  afterSalesLossPercent: 3,
   maxMinOrder: 1,
   singleBuyExtra: 1,
   defaultStock: 100,
@@ -34,7 +38,7 @@ export const DEFAULT_CONFIG: Config = {
   shippingTemplate: "",
   categoryHint: "",
   allowWarn: true,
-  requireDropship: false,
+  requireDropship: true,
   bannedKeywords: [
     "香烟", "烟草", "电子烟", "雾化", "处方药", "药品", "减肥药", "壮阳", "催情", "成人用品", "情趣",
     "仿真枪", "弹弓", "弩", "管制刀具", "匕首", "甩棍", "电击", "防狼", "窃听", "监听", "针孔",
@@ -85,7 +89,9 @@ function sanitize(p: Partial<Config>): Partial<Config> {
   if (p.shippingCost !== undefined) out.shippingCost = num(p.shippingCost, d.shippingCost);
   if (p.fixedCost !== undefined) out.fixedCost = num(p.fixedCost, d.fixedCost);
   if (p.pddFeePercent !== undefined) out.pddFeePercent = num(p.pddFeePercent, d.pddFeePercent, 0, 50);
-  if (p.minProfit !== undefined) out.minProfit = num(p.minProfit, d.minProfit);
+  if (p.minProfit !== undefined) out.minProfit = num(p.minProfit, d.minProfit, 0, 100000);
+  if (p.targetRoi !== undefined) out.targetRoi = num(p.targetRoi, d.targetRoi, 0.1, 100);
+  if (p.afterSalesLossPercent !== undefined) out.afterSalesLossPercent = num(p.afterSalesLossPercent, d.afterSalesLossPercent, 0, 100);
   if (p.maxMinOrder !== undefined) out.maxMinOrder = num(p.maxMinOrder, d.maxMinOrder, 1, 10000);
   if (p.singleBuyExtra !== undefined) out.singleBuyExtra = num(p.singleBuyExtra, d.singleBuyExtra, 0, 1000);
   if (p.defaultStock !== undefined) out.defaultStock = num(p.defaultStock, d.defaultStock, 1, 100000);

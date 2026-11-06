@@ -9,7 +9,12 @@ export type SkuPricing = {
   cost: number;
   group: number;
   single: number;
-  market: number;
+  shippingCost: number;
+  landedCost: number;
+  promotionCost: number;
+  platformFee: number;
+  afterSalesCost: number;
+  singleProfit: number;
   profit: number;
   stock: number;
 };
@@ -26,7 +31,7 @@ export type Job = {
   verdict: "ok" | "warn" | "blocked" | "";
   reasons: Reason[];
   product: { gallery?: string[]; skus?: unknown[]; cost?: number } | null;
-  pricing: { skus: SkuPricing[]; minProfit: number; maxGroup: number } | null;
+  pricing: { skus: SkuPricing[]; minProfit: number; maxGroup: number; assumptions?: { targetRoi: number; pddFeePercent: number; afterSalesLossPercent: number; minProfit: number } } | null;
   logs: { t: string; m: string }[];
   pddGoodsId: string;
   error: string;

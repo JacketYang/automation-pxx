@@ -19,6 +19,7 @@
  *   --out <dir>        图片和截图输出目录，默认 ./output
  */
 import { chromium } from "playwright-core";
+import { priceSku } from "./pricing.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -288,18 +289,30 @@ async function extract1688(page, context, offerId, step) {
   const gallery = uniq([...raw.images, ...raw.domImages].map(normImg).filter(Boolean)).slice(0, 10);
   const detailImages = uniq([...raw.detailImages, ...descImgs].map(normImg).filter(Boolean)).filter((u) => !gallery.includes(u)).slice(0, 30);
 
+  // 只从“代发下单”区域读取单件代发价与运费，避免误用批发阶梯价。
+  const dropshipSection = text.includes("代发下单")
+    ? text.split("代发下单").slice(1).join("代发下单").split(/官方仓退货|商家代发热度|铺货素材预览/)[0]
+    : "";
+  const onePiecePriceMatch = dropshipSection.match(/(?:1件价格|一件价格)[\s\S]{0,24}?[¥￥]\s*([\d.]+)/);
+  const onePiecePrice = onePiecePriceMatch ? Number(onePiecePriceMatch[1]) : null;
+  const shipMatch = dropshipSection.match(/(?:运费|快递费)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*(?:元)?(?:起)?/);
+  const freeShip = /(?:1件|一件)[^\n]{0,20}包邮|包邮/.test(dropshipSection);
+  const onePieceDropship = /一件代发|1件代发|1件价格|一件价格|1件包邮|一件包邮|1件起发|一件起发/i.test(dropshipSection);
+
   // 规格
   const dims = (raw.skuProps || []).filter((d) => d.prop && d.value.length).slice(0, 3);
   const baseTier = raw.tiers.filter((t) => t.price > 0).sort((a, b) => a.begin - b.begin)[0];
   const domMin = raw.domPrices.filter((n) => n > 0).sort((a, b) => a - b)[0];
-  let baseCost = baseTier?.price || domMin || 0;
+  let baseCost = onePiecePrice || baseTier?.price || domMin || 0;
   const skus = [];
   if (raw.skuMap) {
     for (const [key, v] of Object.entries(raw.skuMap)) {
       const attrs = key.split(/&gt;|>/).map((s) => s.trim()).filter(Boolean);
       const price = parseFloat(v.price);
+      // SKU价格若低于代发区单件价，按较高者计，避免误用批发SKU价低估成本。
+      const skuCost = price > 0 ? (onePiecePrice > 0 ? Math.max(price, onePiecePrice) : price) : baseCost;
       const img = dims[0]?.value.find((x) => x.name === attrs[0])?.imageUrl || "";
-      skus.push({ name: attrs.join(" / "), attrs, cost: price > 0 ? price : baseCost, stock: Number(v.canBookCount) || 0, image: normImg(img) || "" });
+      skus.push({ name: attrs.join(" / "), attrs, cost: skuCost, stock: Number(v.canBookCount) || 0, image: normImg(img) || "" });
     }
   }
   if (!baseCost && skus.length) baseCost = Math.min(...skus.map((s) => s.cost).filter((n) => n > 0));
@@ -317,9 +330,12 @@ async function extract1688(page, context, offerId, step) {
   const hours = [...text.matchAll(/(\d+)\s*小时\s*(?:内)?\s*发货/g)].map((m) => parseInt(m[1], 10));
   if (/当天发货|当日发货|次日发/.test(text)) hours.push(24);
   const flags2 = {
-    dropship: /一件代发|支持代发|代发/.test(text.slice(0, 12000)),
+    dropship: /一件代发|支持代发|代发/.test(dropshipSection),
+    onePieceDropship,
+    onePiecePrice,
     sevenDay: /7天(?:无理由|包换)|七天无理由/.test(text),
-    freeShip: /包邮/.test(text.slice(0, 12000)),
+    freeShip,
+    shippingCost: freeShip ? 0 : shipMatch ? Number(shipMatch[1]) : null,
     shipHours: hours.length ? Math.min(...hours) : null,
   };
 
@@ -331,6 +347,7 @@ async function extract1688(page, context, offerId, step) {
     seller: raw.seller,
     unavailable,
     cost: round2(baseCost || 0),
+    onePiecePrice,
     minOrder,
     stock: raw.stockField ?? (skus.length ? skus.reduce((a, s) => a + s.stock, 0) : null),
     gallery,
@@ -355,16 +372,6 @@ const hit = (hay, kw) => {
   return hay.includes(k);
 };
 
-function priceSku(cost, cfg) {
-  const base = cost + cfg.shippingCost + cfg.fixedCost;
-  // 取“按加价率”和“保证最低利润”两者中较高的价格
-  const byMarkup = base * (1 + cfg.markupPercent / 100);
-  const byProfit = (base + cfg.minProfit) / (1 - cfg.pddFeePercent / 100);
-  const group = Math.ceil(Math.max(byMarkup, byProfit) * 10) / 10;
-  const profit = group * (1 - cfg.pddFeePercent / 100) - base;
-  const single = round2(group + cfg.singleBuyExtra);
-  return { cost: round2(cost), group: round2(group), single, market: Math.ceil(single * 1.5), profit: round2(profit) };
-}
 
 function evaluate(p, cfg) {
   const reasons = [];
@@ -375,7 +382,7 @@ function evaluate(p, cfg) {
   if (p.gallery.length === 0) add("block", "no_images", "没读到商品主图");
   else if (p.gallery.length < 3) add("warn", "few_images", `主图只有 ${p.gallery.length} 张，拼多多要求至少 3 张，会用 SKU 图/详情图补`);
   if (!(p.cost > 0)) add("block", "no_price", "没读到价格");
-  if (p.minOrder && p.minOrder > cfg.maxMinOrder) add("block", "min_order", `起批量 ${p.minOrder}，一件代发需要 ${cfg.maxMinOrder} 件起批`);
+  if (p.minOrder && p.minOrder > cfg.maxMinOrder && !p.flags.onePieceDropship) add("block", "min_order", `起批量 ${p.minOrder}，且没有读取到明确的一件代发价格`);
 
   const hay = [p.title, ...Object.values(p.attrs || {}), ...p.skus.map((s) => s.name)].join(" ").toLowerCase();
   const bad = cfg.bannedKeywords.filter((k) => hit(hay, k));
@@ -391,7 +398,9 @@ function evaluate(p, cfg) {
   if (!p.flags.sevenDay) add("warn", "no_7day", "页面没看到“7天无理由”，拼多多多数类目强制要求");
   if (p.flags.shipHours && p.flags.shipHours > cfg.promiseHours)
     add("block", "ship_slow", `货源发货时效 ${p.flags.shipHours} 小时，超过你承诺的 ${cfg.promiseHours} 小时`);
-  if (!p.flags.dropship) add(cfg.requireDropship ? "block" : "warn", "no_dropship", "页面没出现“一件代发”字样，请先和商家确认支持代发");
+  if (!p.flags.onePieceDropship) add(cfg.requireDropship ? "block" : "warn", "no_dropship", "未识别到明确的“1件价格/一件代发”信息；不能把批发阶梯价当成单件代发成本");
+  if (!(p.onePiecePrice > 0)) add("block", "dropship_price_unknown", "未读取到代发区域明确的 1 件价格；不能使用批发阶梯价或搜索页最低价代替");
+  if (!Number.isFinite(p.flags.shippingCost)) add("block", "shipping_unknown", `未读取到代发区域的包邮或明确运费；当前仅用设置中的 ¥${cfg.shippingCost} 估算，核实实际单件运费后再上架`);
   if (p.dims.length > 2) add("warn", "many_dims", `规格维度 ${p.dims.length} 个，拼多多最多 2 个，需手动合并`);
   if (p.skus.length > 50) add("warn", "many_skus", `SKU ${p.skus.length} 个，较多`);
   if (!p.skuRead) add("warn", "sku_unread", "没读到规格明细，按单规格处理（有多规格的话需要手动补）");
@@ -400,15 +409,21 @@ function evaluate(p, cfg) {
 
   // 定价
   const list = p.skus.length ? p.skus : [{ name: "默认", attrs: ["默认"], cost: p.cost, stock: p.stock || 0, image: "" }];
+  const effectiveShipping = Number.isFinite(p.flags.shippingCost) ? p.flags.shippingCost : cfg.shippingCost;
   const skuPricing = list.map((s) => {
-    const pr = priceSku(s.cost > 0 ? s.cost : p.cost, cfg);
+    const pr = priceSku(s.cost > 0 ? s.cost : p.cost, cfg, effectiveShipping);
     return { name: s.name, attrs: s.attrs, image: s.image, stock: Math.max(1, Math.min(cfg.defaultStock, s.stock > 0 ? s.stock : cfg.defaultStock)), ...pr };
   });
   const minProfit = Math.min(...skuPricing.map((s) => s.profit));
-  const worst = Math.max(...skuPricing.map((s) => s.group / Math.max(s.cost, 0.01)));
+  const worst = Math.max(...skuPricing.map((s) => s.group / Math.max(s.landedCost, 0.01)));
   if (p.cost > 0 && worst > MAX_PRICE_MULTIPLE)
-    add("block", "low_margin", `成本太低：要卖到成本的 ${round2(worst)} 倍（含快递 ¥${cfg.shippingCost}）才能赚到 ¥${cfg.minProfit}，价格没有竞争力`);
-  const pricing = { skus: skuPricing, minProfit: round2(minProfit), maxGroup: Math.max(...skuPricing.map((s) => s.group)) };
+    add("block", "low_margin", \`含运费到岸成本下，目标利润售价需要达到成本的 \${round2(worst)} 倍（上限 \${MAX_PRICE_MULTIPLE} 倍），建议先对比同规格市场价\`);
+  const pricing = {
+    skus: skuPricing,
+    minProfit: round2(minProfit),
+    maxGroup: Math.max(...skuPricing.map((s) => s.group)),
+    assumptions: { targetRoi: cfg.targetRoi, pddFeePercent: cfg.pddFeePercent, afterSalesLossPercent: cfg.afterSalesLossPercent, minProfit: cfg.minProfit },
+  };
 
   const verdict = reasons.some((r) => r.level === "block") ? "blocked" : reasons.some((r) => r.level === "warn") ? "warn" : "ok";
   if (verdict === "ok") add("info", "ok", "未发现问题，可以上架");
@@ -673,7 +688,7 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
     await fillByLabel(page, /库存/, s.stock).catch(() => {});
     if (a) priced = 1;
   }
-  await attempt("参考价", () => fillByLabel(page, /参考价|市场价/, pricing.skus[0].market));
+  // 不自动填写虚构的“市场参考价”；仅填核算出的拼单价和单买价。
   await attempt(`承诺发货 ${cfg.promiseHours} 小时`, async () => {
     if (!(await clickText(page, new RegExp(`${cfg.promiseHours}\\s*小时`), 2000))) throw new Error("没找到选项");
   });

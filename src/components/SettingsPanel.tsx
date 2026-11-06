@@ -4,11 +4,13 @@ import { useState } from "react";
 import type { Config } from "./types";
 
 const NUM_FIELDS: { key: keyof Config; label: string; hint: string; step?: string }[] = [
-  { key: "markupPercent", label: "加价率 %", hint: "在（成本+快递）基础上加价" },
-  { key: "shippingCost", label: "预估快递费 ¥", hint: "每单快递成本", step: "0.1" },
+  { key: "markupPercent", label: "最低加价率 %", hint: "作为售价下限；仍需满足目标投产比和经营利润" },
+  { key: "shippingCost", label: "运费缺失时估算 ¥", hint: "仅用于暂算；未核实包邮/运费会阻止上架", step: "0.1" },
   { key: "fixedCost", label: "其它固定成本 ¥", hint: "包装等", step: "0.1" },
-  { key: "pddFeePercent", label: "平台服务费 %", hint: "技术服务费", step: "0.1" },
-  { key: "minProfit", label: "最低利润 ¥", hint: "低于则自动抬价", step: "0.1" },
+  { key: "pddFeePercent", label: "平台费率 %", hint: "按店铺实际费率核实；默认 0.6%", step: "0.1" },
+  { key: "minProfit", label: "目标经营利润 ¥", hint: "扣除平台费、售后损耗和推广费后的每单目标", step: "0.1" },
+  { key: "targetRoi", label: "目标投产比", hint: "成交额 ÷ 推广费；2 表示推广费按售价的 50% 估算", step: "0.1" },
+  { key: "afterSalesLossPercent", label: "售后损耗率 %", hint: "退款、补发、售后等预估比例", step: "0.1" },
   { key: "maxMinOrder", label: "最大起批量", hint: "一件代发=1" },
   { key: "singleBuyExtra", label: "单买价加价 ¥", hint: "单买价=拼单价+此值", step: "0.1" },
   { key: "defaultStock", label: "上架库存", hint: "不超过货源库存" },
@@ -77,7 +79,7 @@ export default function SettingsPanel({ config, onSaved }: { config: Config; onS
         </label>
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={Boolean(draft.requireDropship)} onChange={(e) => setDraft({ ...draft, requireDropship: e.target.checked })} />
-          页面没写“一件代发”就拒绝
+          未识别明确单件代发信息就拒绝
         </label>
       </div>
 
