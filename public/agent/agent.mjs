@@ -719,14 +719,14 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
     await step(`  当前拼多多页面需要登录：${page.url()}`);
     await waitForHuman(page, async () => {
       for (const candidate of context.pages()) {
-        if (/mms\\.pinduoduo\\.com/.test(candidate.url()) && !(await isPddLoginRequired(candidate))) {
+        if (/mms\.pinduoduo\.com/.test(candidate.url()) && !(await isPddLoginRequired(candidate))) {
           page = candidate;
           return true;
         }
       }
       return !(await isPddLoginRequired(page));
     }, "请在当前弹出的拼多多浏览器页面完成登录；登录成功后会自动继续", step);
-    if (!/mms\\.pinduoduo\\.com/.test(page.url())) {
+    if (!/mms\.pinduoduo\.com/.test(page.url())) {
       await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
       await sleep(2000);
     }
