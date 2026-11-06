@@ -22,15 +22,29 @@ export default function Dashboard() {
   const [jobs,setJobs]=useState<Job[]>([]);
   const [error,setError]=useState("");
   const [busy,setBusy]=useState(false);
+  const [minProfit,setMinProfit]=useState("3");
+  const [targetRoi,setTargetRoi]=useState("2");
+  const [settingsSaved,setSettingsSaved]=useState(false);
+  const [savingSettings,setSavingSettings]=useState(false);
   const load=useCallback(async()=>{
     try {
-      const [h,j]=await Promise.all([fetch(API+"/health",{cache:"no-store"}),fetch(API+"/jobs",{cache:"no-store"})]);
-      if(!h.ok||!j.ok) throw new Error("Agent 未响应");
-      const health=await h.json(); const data=await j.json();
-      setOnline(Boolean(health.online)); setHost(health.host||"本机"); setJobs(data.jobs||[]); setError("");
+      const [h,j,s]=await Promise.all([fetch(API+"/health",{cache:"no-store"}),fetch(API+"/jobs",{cache:"no-store"}),fetch(API+"/settings",{cache:"no-store"})]);
+      if(!h.ok||!j.ok||!s.ok) throw new Error("Agent 未响应");
+      const health=await h.json(); const data=await j.json(); const settings=await s.json();
+      setOnline(Boolean(health.online)); setHost(health.host||"本机"); setJobs(data.jobs||[]);
+      setMinProfit(String(settings.minProfit ?? 3)); setTargetRoi(String(settings.targetRoi ?? 2)); setError("");
     } catch { setOnline(false); setHost(""); }
   },[]);
   useEffect(()=>{ load(); const t=window.setInterval(load,1500); return ()=>window.clearInterval(t); },[load]);
+  async function saveSettings(){
+    setSavingSettings(true);setSettingsSaved(false);setError("");
+    try {
+      const r=await fetch(API+"/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({minProfit:Number(minProfit),targetRoi:Number(targetRoi)})});
+      const data=await r.json(); if(!r.ok) throw new Error(data.error||"保存失败");
+      setMinProfit(String(data.minProfit));setTargetRoi(String(data.targetRoi));setSettingsSaved(true);
+    } catch(e){setError(e instanceof Error?e.message:"设置保存失败");}
+    finally{setSavingSettings(false);}
+  }
   async function submit(){
     setBusy(true);setError("");
     try {
@@ -47,8 +61,17 @@ export default function Dashboard() {
       <div className={`ml-auto rounded-full px-4 py-2 text-sm font-medium ${online?"bg-emerald-100 text-emerald-800":"bg-red-100 text-red-700"}`}>{online?"● Agent 在线 · "+host:"● Agent 未连接"}</div>
     </header>
     {!online&&<div className="mb-5 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">请先在电脑上启动一次本机 Agent（安装目录里的 <b>start-agent.bat</b>）。启动后此处会自动变成在线，不需要复制商品命令。</div>}
+    <section className="mb-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <div className="flex flex-wrap items-end gap-4">
+        <div><h2 className="font-semibold">利润与投产比</h2><p className="mt-1 text-xs text-slate-500">这两项仍是硬门槛；修改后保存在本机。</p></div>
+        <label className="text-sm">每单最低利润（元）<input type="number" min="0" max="10000" step="0.5" value={minProfit} onChange={e=>{setMinProfit(e.target.value);setSettingsSaved(false);}} className="mt-1 block w-32 rounded-lg border border-slate-300 p-2"/></label>
+        <label className="text-sm">目标 ROI<input type="number" min="1.01" max="100" step="0.1" value={targetRoi} onChange={e=>{setTargetRoi(e.target.value);setSettingsSaved(false);}} className="mt-1 block w-32 rounded-lg border border-slate-300 p-2"/></label>
+        <button disabled={!online||savingSettings} onClick={saveSettings} className="rounded-lg bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-40">{savingSettings?"保存中…":"保存参数"}</button>
+        {settingsSaved&&<span className="text-xs text-emerald-700">已保存到本机</span>}
+      </div>
+    </section>
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-      <h2 className="font-semibold">添加 1688 商品链接</h2><p className="mt-1 text-sm text-slate-500">支持一次粘贴多个链接，每行一个。</p>
+      <h2 className="font-semibold">添加 1688 商品链接</h2><p className="mt-1 text-sm text-slate-500">支持一次粘贴多个链接，每行一个。当前为流程联调宽松模式，风险项会提示但不轻易淘汰。</p>
       <textarea value={urls} onChange={e=>setUrls(e.target.value)} rows={4} placeholder="https://detail.1688.com/offer/123456789012.html" className="mt-3 w-full rounded-lg border border-slate-300 p-3 font-mono text-sm"/>
       <div className="mt-3 grid gap-2 md:grid-cols-3">{MODES.map(m=><label key={m.v} className={`cursor-pointer rounded-lg border p-3 text-sm ${mode===m.v?"border-blue-500 bg-blue-50":"border-slate-200"}`}><input type="radio" className="mr-2" checked={mode===m.v} onChange={()=>setMode(m.v)}/><b>{m.t}</b><div className="mt-1 text-xs text-slate-500">{m.d}</div></label>)}</div>
       <div className="mt-3 flex items-center gap-3"><button disabled={!online||!urls.trim()||busy} onClick={submit} className="rounded-lg bg-slate-900 px-5 py-2 text-sm font-medium text-white disabled:opacity-40">{busy?"提交中…":"开始处理"}</button>{error&&<span className="text-sm text-red-600">{error}</span>}</div>
