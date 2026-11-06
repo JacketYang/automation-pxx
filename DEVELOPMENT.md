@@ -22,7 +22,8 @@
 - 不引入 PostgreSQL、Neon、Supabase、Redis、ORM 或迁移系统。
 - 不引入登录系统、权限系统、Token、AUTH_SECRET、DASHBOARD_PASSWORD 或其他部署密钥。
 - 不需要 Vercel Environment Variables；如未来确有必要，必须先说明无法用更简单方案解决的原因。
-- 网页只负责生成本机执行命令和展示说明；本机 Agent 负责真实浏览器任务。
+- 网页通过 localhost 直接连接本机 Agent，检测在线状态、下发任务并展示进度；本机 Agent 负责真实浏览器任务。
+- Agent 仅监听 127.0.0.1，不把浏览器登录态或商品数据发送到云端。
 - 不得把本机登录态、Cookie、密码、验证码或 `chrome-profile` 上传到 Vercel/GitHub。
 
 ## 依赖与部署
