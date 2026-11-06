@@ -708,7 +708,7 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   for (const f of files.skuImages) if (gal.length < 3 && !gal.includes(f)) gal.push(f);
   for (const f of files.detail) if (gal.length < 3 && !gal.includes(f)) gal.push(f);
   const okImg = await attempt("商品轮播图", () => uploadByLabel(page, /商品轮播图|轮播图|商品主图/, gal.slice(0, 10), step));
-  await attempt("商品详情图", () => uploadByLabel(page, /商品详情图|图文详情|详情图/, (files.detail.length ? files.detail : files.gallery).slice(0, 20), step));
+  await attempt("商品详情图", () => uploadByLabel(page, /商品详情|商品详情图|图文详情|详情图/, (files.detail.length ? files.detail : files.gallery).slice(0, 20), step));
   await attempt("商品规格", () => addSpecs(page, product, step));
   let priced = 0;
   await attempt("价格/库存表", async () => {
