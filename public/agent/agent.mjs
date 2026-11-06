@@ -750,6 +750,45 @@ async function uploadCategoryCover(page, imagePath, step) {
       });
 
       const button = input.locator("xpath=..");
+      // 内置浏览器实测（真实已登录页面）：goodsCarousel_btns 上写着行内 style="display:none"，
+      // 由 React 的 onMouseEnter 改为 flex；未展开时“本地上传”按钮盒子是 0×0，
+      // Playwright 因此判定 element is not visible，重试 20 次全部无效。
+      // hover 展开后按钮为 86×24，点击它内部会调用 input.click()（实测 2 次），
+      // 拼多多此处未使用 File System Access API，所以 filechooser 路径成立。
+      const host = await input.evaluateHandle((el) => {
+        for (let d = 0, node = el; node && d <= 8; d++, node = node.parentElement) {
+          const cs = getComputedStyle(node);
+          if (cs.display !== "none" && cs.visibility !== "hidden" && node.getBoundingClientRect().width > 0) return node;
+        }
+        return null;
+      });
+
+      let revealed = await button.isVisible().catch(() => false);
+      for (let i = 0; i < 10 && !revealed; i++) {
+        await host.hover({ timeout: 3000 }).catch(() => {});
+        await sleep(250);
+        revealed = await button.isVisible().catch(() => false);
+      }
+      await host.dispose().catch(() => {});
+
+      if (!revealed) {
+        const chain = await input.evaluate((el) => {
+          const out = [];
+          for (let d = 0, node = el; node && d <= 8; d++, node = node.parentElement) {
+            const r = node.getBoundingClientRect();
+            const cs = getComputedStyle(node);
+            out.push({
+              depth: d, tag: node.tagName, cls: String(node.className || "").slice(0, 90),
+              w: Math.round(r.width), h: Math.round(r.height),
+              display: cs.display, visibility: cs.visibility,
+              inline: (node.getAttribute("style") || "").slice(0, 60),
+            });
+          }
+          return out;
+        }).catch(() => []);
+        throw new Error(`hover 上传入口后“本地上传”按钮仍没有可见盒子，未执行点击。祖先链=${JSON.stringify(chain)}`);
+      }
+
       const chooserPromise = frame.page().waitForEvent("filechooser", { timeout: 10000 });
       // click 失败或有多个候选时，这个 promise 可能永远走不到 await。
       // 无 handler 的 rejection 会打死整个 Agent 进程（Node v15+ 默认 throw），

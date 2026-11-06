@@ -238,7 +238,38 @@
 - 不要增加 toast 监听或把 toast 当成图片上传的替代验证。
 - 上传成功的唯一有效证据应是拼多多轮播图上传区域确实出现新图片/计数增长/可确认的上传完成状态；不能仅以文件选择器事件触发或本地 input.files 有值作为成功。
 
-### 本地同步说明
+### 2026-11-06 23:06 真实页面第二轮反馈
+
+用户本机日志给出两条事实，且否证了本轮两个候选解释：
+
+- `首图格式校验通过：jpeg` —— 该商品首图确实是 jpeg，**webp 未命中本次数据**（闸门仍保留，属真实隐患）。
+- 失败点为 `locator.click: Timeout 10000ms exceeded`，Playwright 明确 **`element is not visible`**，重试 20 次全部如此；解析到的触发节点是 `<button type="button" data-testid="beast-core-button" class="BTN_outerWrapper_5-194-0 …">`。**`filechooser` 从未进入判断**，之前列的 File System Access API、新标签页/弹窗两条推论全部不适用（代码没走到那一步）。
+
+### 根因（内置浏览器实测真实已登录页面，已确定）
+
+- 承载“图片空间上传 / 本地上传”两个按钮的 `goodsCarousel_btns` 上挂着**行内 `style="display:none"`**，由 React 的 `onMouseEnter` 改写为 flex；未展开时按钮盒子为 0×0。
+- 因此 Playwright 判定 `element is not visible`、重试 20 次全部无效。**agent 代码从未 hover 那个 96×96 的 `goodsCarousel_uploadImgEnter` 入口**，面板永远不展开——这就是首图上传长期卡住的根因，与选择器、filechooser、文件格式都无关。
+- 对入口派发 `mouseover` 后实测：`goodsCarousel_btns` 的 display `none → flex`，“本地上传”按钮得到 86×24；点击该按钮内部调用 `input.click()`（实测 2 次）。`window.showOpenFilePicker` 在浏览器里存在但拼多多此处未使用，所以 Playwright 的 `filechooser` 事件路径成立。
+- 同时**否证两个先前推断**：① 不是 `visibility:hidden`；② 上一轮“display:none 时 innerText 为空、所以筛选不可能通过”的推理是错的——规范规定未渲染元素的 `innerText` 回退为 `textContent`，真实测量为 `innerText:"本地上传", visibility:visible, rects:0, offsetW:0`，“筛选通过但不可见”完全自洽。
+
+### 本轮改动
+
+hover input 最近的可见祖先（真实页面即 96×96 的 `uploadImgEnter`），轮询“本地上传”按钮盒子直至展开（最多 10 次 × 250ms），展开后才执行 click；若仍未展开，输出祖先链的 `w/h/display/visibility/行内 style` 再抛错，不再用 10 秒点击超时去猜。
+
+### 本地 A/B 验证
+
+fixture 已改成与真实页面相同的机制（行内 `display:none` + `mouseover` 监听展开），直接抽取仓库源码执行：
+
+- 已推送版本 `653935e`：复现出用户本机同样的 `locator.click: Timeout 10000ms exceeded`，10.0s 失败；
+- 本轮修复版本：0.4s 上传成功，计数变为 `(1/10)`。
+
+**仍未在真实拼多多页面验证**，需要用户本机跑一次确认。
+
+### 真实页面结构是怎么拿到的
+
+由用户在 Qoder **内置浏览器**中本人扫码登录（登录页的拼图滑块验证码由用户手动完成，未做任何验证码绕过），再用浏览器自动化接口对真实已登录页面做只读探测：祖先链几何与计算样式、样式表规则枚举（`.goodsCarousel_*` 不在可读的同源样式表内，另有 2 张跨域表被拒）、`display:none` 的行内属性确认、`mouseover` 展开前后的尺寸对比，以及临时挂钩 `HTMLInputElement.prototype.click` 计数以确认调用链（探测结束即还原）。后续接手者可直接复用这条路径，不必再靠日志猜。注意：本机云实例上的独立 Chromium 无法走通登录，不要用那条路。
+
+## 本地同步说明
 
 每次修改 `public/agent/agent.mjs` 后，用户只需替换本地：
 `D:\ISO\pxx\pdd-agent\agent.mjs`
