@@ -692,16 +692,40 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
   throw new Error("点击下一步后未进入商品详情页（goods_add）；请在浏览器确认类目并重试");
 }
 
+async function isPddLoginRequired(page) {
+  let u;
+  try { u = new URL(page.url()); } catch { return true; }
+  const host = u.hostname.toLowerCase();
+  const path = u.pathname.toLowerCase();
+  if (/^(login|passport)(\\.|$)/.test(host) || /(^|\\/)(login|passport)(\\/|$)/.test(path)) return true;
+
+  // 不再用“页面出现账号登录/手机登录文字”作为唯一依据，避免把普通页面文案误判成未登录。
+  const visibleLoginControl = await page.locator(
+    'input[placeholder*="手机号"]:visible, input[placeholder*="手机号码"]:visible, input[placeholder*="验证码"]:visible, input[placeholder*="短信"]:visible'
+  ).count().catch(() => 0);
+  if (visibleLoginControl) {
+    const body = await page.locator("body").innerText({ timeout: 1500 }).catch(() => "");
+    if (/登录/.test(body) && /验证码|手机号|扫码/.test(body)) return true;
+  }
+  return false;
+}
+
 async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, mode, step }) {
   let page = await context.newPage();
   await step("打开拼多多商家后台发布页", { stage: "拼多多：打开发布页" });
   await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-  const needLogin = async () => /login|passport/.test(page.url()) || (await page.getByText(/扫码登录|账号登录|手机登录/).first().isVisible().catch(() => false));
   await sleep(2500);
-  if (await needLogin()) {
-    await waitForHuman(page, async () => !(await needLogin()), "拼多多商家后台需要登录", step);
-    await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-    await sleep(2000);
+  if (await isPddLoginRequired(page)) {
+    await step(`  当前拼多多页面需要登录：${page.url()}`);
+    await waitForHuman(page, async () => {
+      const ready = context.pages().find(async (p) => !(await isPddLoginRequired(p)));
+      if (ready) page = ready;
+      return !(await isPddLoginRequired(page));
+    }, "请在当前弹出的拼多多浏览器页面完成登录；登录成功后会自动继续", step);
+    if (!/mms\\.pinduoduo\\.com/.test(page.url())) {
+      await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+      await sleep(2000);
+    }
   }
   for (let i = 0; i < 3; i++) if (!(await clickText(page, /^(我知道了|知道了|以后再说|暂不|跳过)$/, 1500))) break;
 
@@ -903,7 +927,7 @@ async function main() {
     console.log("1688 登录态：", ck.some((c) => c.name === "__cn_logon__" && c.value === "true") ? "✔ 已登录" : "⚠ 未检测到（可能 cookie 名变了，不一定有问题）");
     await p2.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
     await sleep(2500);
-    console.log("拼多多登录态：", /login|passport/.test(p2.url()) ? "⚠ 仍在登录页" : "✔ 已登录");
+    console.log("拼多多登录态：", await isPddLoginRequired(p2) ? "⚠ 仍需要登录" : "✔ 未检测到登录拦截");
     await close();
     return;
   }
