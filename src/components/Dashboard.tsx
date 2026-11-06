@@ -1,178 +1,64 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import JobCard from "./JobCard";
-import SettingsPanel from "./SettingsPanel";
-import SetupGuide from "./SetupGuide";
-import type { AgentInfo, Config, Job } from "./types";
+import { useMemo, useState } from "react";
 
-const MODES = [
-  { v: "check", t: "只判断", d: "读取 1688 商品，告诉你能不能上、建议卖多少钱" },
-  { v: "fill", t: "判断 + 填好表单", d: "能上就在拼多多后台填好，停在“提交”前由你确认" },
-  { v: "publish", t: "判断 + 自动上架", d: "能上就全自动提交（填写不完整时会自动退回到“待确认”）" },
-] as const;
+const SAMPLE = "https://detail.1688.com/offer/123456789012.html";
 
 export default function Dashboard() {
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [agent, setAgent] = useState<AgentInfo>({});
-  const [config, setConfig] = useState<Config | null>(null);
-  const [now, setNow] = useState(() => Date.now());
   const [urls, setUrls] = useState("");
-  const [mode, setMode] = useState<"check" | "fill" | "publish">("fill");
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [tab, setTab] = useState<"jobs" | "setup" | "rules">("jobs");
+  const [mode, setMode] = useState<"check" | "list" | "submit">("list");
+  const [copied, setCopied] = useState(false);
+  const commands = useMemo(() => urls.split(/[\\s，,；;]+/).map((x) => x.trim()).filter(Boolean).map((url) => {
+    const escaped = url.replace(/'/g, "''");
+    if (mode === "check") return `node agent.mjs check '${escaped}'`;
+    if (mode === "submit") return `node agent.mjs list '${escaped}' --submit`;
+    return `node agent.mjs list '${escaped}'`;
+  }).join("\\n"), [urls, mode]);
 
-  const load = useCallback(async () => {
-    try {
-      const [a, b] = await Promise.all([fetch("/api/jobs").then((r) => r.json()), fetch("/api/settings").then((r) => r.json())]);
-      setJobs(a.jobs);
-      setAgent(b.agent);
-      setConfig((c) => c ?? b.config);
-      setNow(Date.now());
-    } catch {
-      /* ignore transient errors */
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 2500);
-    return () => clearInterval(t);
-  }, [load]);
-
-  const online = agent.at ? now - new Date(agent.at).getTime() < 20000 : false;
-
-  async function submit() {
-    setBusy(true);
-    setMsg(null);
-    const r = await fetch("/api/jobs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ urls, mode }) });
-    const j = await r.json();
-    setBusy(false);
-    if (!r.ok) return setMsg({ ok: false, text: j.error || "提交失败" });
-    setUrls("");
-    setMsg({
-      ok: true,
-      text: `已加入队列 ${j.created} 个${j.skipped ? `，${j.skipped} 个已在排队/处理中被跳过` : ""}${j.invalid?.length ? `，${j.invalid.length} 个无法识别` : ""}${online ? "" : "。注意：agent 还没连接，请先看“连接 agent”"}`,
-    });
-    load();
+  async function copy() {
+    await navigator.clipboard.writeText(commands);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
   }
 
-  const counts = {
-    active: jobs.filter((j) => j.status === "queued" || j.status === "running").length,
-    ok: jobs.filter((j) => ["eligible", "filled", "published"].includes(j.status)).length,
-    rejected: jobs.filter((j) => j.status === "rejected").length,
-    published: jobs.filter((j) => j.status === "published").length,
-  };
-  const waiting = jobs.find((j) => j.status === "running" && j.stage.startsWith("等待你操作"));
-
   return (
-    <main className="mx-auto max-w-4xl px-4 py-8">
-      <header className="mb-6 flex flex-wrap items-center gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold text-slate-950">1688 → 拼多多 自动上架</h1>
-          <p className="text-sm text-slate-500">贴 1688 链接 → 判断能不能上 → 自动在拼多多商家后台上架</p>
-        </div>
-        <button
-          type="button"
-          onClick={() => setTab("setup")}
-          className={`ml-auto flex items-center gap-2 rounded-full px-3 py-1.5 text-sm ${online ? "bg-emerald-100 text-emerald-800" : "bg-red-100 text-red-700"}`}
-        >
-          <span className={`h-2 w-2 rounded-full ${online ? "bg-emerald-500" : "bg-red-500"}`} />
-          {online ? `Agent 在线${agent.host ? ` · ${agent.host}` : ""}` : "Agent 未连接（点击查看连接方法）"}
-        </button>
+    <main className="mx-auto max-w-3xl px-4 py-10">
+      <header className="mb-8">
+        <div className="mb-2 text-sm font-medium text-blue-700">PXX · 第一阶段</div>
+        <h1 className="text-3xl font-bold tracking-tight">1688 商品分析 → 拼多多上架</h1>
+        <p className="mt-3 text-slate-600">先把商品分析、SKU 成本核算和上架流程跑通。网页不接数据库，商品浏览器操作在你自己的 Windows 电脑完成。</p>
       </header>
-
-      {waiting && (
-        <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
-          <strong>⏸ 需要你操作：</strong>
-          {waiting.stage.replace("等待你操作：", "")}（任务 #{waiting.id}，请切换到 agent 打开的浏览器窗口）
-        </div>
-      )}
-
-      <section className="mb-6 rounded-2xl bg-white p-5 shadow-sm">
-        <h2 className="mb-2 text-sm font-semibold text-slate-700">添加 1688 商品链接（可一次贴多个，每行一个）</h2>
-        <textarea
-          value={urls}
-          onChange={(e) => setUrls(e.target.value)}
-          rows={3}
-          placeholder="https://detail.1688.com/offer/123456789012.html"
-          className="w-full rounded-lg border border-slate-300 p-3 font-mono text-sm outline-none focus:border-blue-500"
-        />
-        <div className="mt-3 grid gap-2 md:grid-cols-3">
-          {MODES.map((m) => (
-            <label
-              key={m.v}
-              className={`cursor-pointer rounded-lg border p-3 text-sm ${mode === m.v ? "border-blue-500 bg-blue-50" : "border-slate-200 hover:bg-slate-50"}`}
-            >
-              <input type="radio" className="mr-2" checked={mode === m.v} onChange={() => setMode(m.v)} />
-              <span className="font-medium">{m.t}</span>
-              <div className="mt-1 text-xs text-slate-500">{m.d}</div>
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <h2 className="font-semibold">添加 1688 商品链接</h2>
+        <p className="mt-1 text-sm text-slate-500">每行一个链接。这里生成本机 Agent 命令，不会把登录信息或浏览器数据上传到云端。</p>
+        <textarea value={urls} onChange={(e) => setUrls(e.target.value)} rows={5} placeholder={SAMPLE} className="mt-4 w-full rounded-lg border border-slate-300 p-3 font-mono text-sm outline-none focus:border-blue-500" />
+        <div className="mt-4 grid gap-2 sm:grid-cols-3">
+          {([["check", "只分析商品"], ["list", "分析并填表（不提交）"], ["submit", "分析并自动提交"]] as const).map(([value, label]) => (
+            <label key={value} className={`cursor-pointer rounded-lg border p-3 text-sm ${mode === value ? "border-blue-600 bg-blue-50" : "border-slate-200"}`}>
+              <input type="radio" className="mr-2" checked={mode === value} onChange={() => setMode(value)} />{label}
             </label>
           ))}
         </div>
-        <div className="mt-3 flex items-center gap-3">
-          <button
-            onClick={submit}
-            disabled={busy || !urls.trim()}
-            className="rounded-lg bg-slate-900 px-5 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-40"
-          >
-            {busy ? "提交中…" : "开始"}
-          </button>
-          {msg && <span className={`text-sm ${msg.ok ? "text-emerald-700" : "text-red-600"}`}>{msg.text}</span>}
+        <div className="mt-4 flex items-center gap-3">
+          <button disabled={!commands} onClick={copy} className="rounded-lg bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-40">{copied ? "已复制命令" : "复制本机执行命令"}</button>
+          <span className="text-xs text-slate-500">{commands ? `${commands.split("\\n").length} 个商品` : "等待输入链接"}</span>
         </div>
+        {commands && <pre className="mt-4 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-4 text-xs leading-6 text-slate-100">{commands}</pre>}
       </section>
-
-      <nav className="mb-4 flex gap-1 border-b border-slate-200 text-sm">
-        {(
-          [
-            ["jobs", `任务（${jobs.length}）`],
-            ["setup", "连接 agent"],
-            ["rules", "定价与判断规则"],
-          ] as const
-        ).map(([k, t]) => (
-          <button
-            key={k}
-            onClick={() => setTab(k)}
-            className={`-mb-px border-b-2 px-4 py-2 ${tab === k ? "border-slate-900 font-medium text-slate-900" : "border-transparent text-slate-500 hover:text-slate-800"}`}
-          >
-            {t}
-          </button>
-        ))}
-      </nav>
-
-      {tab === "jobs" && (
-        <section className="space-y-3">
-          {jobs.length > 0 && (
-            <div className="flex flex-wrap gap-4 text-xs text-slate-500">
-              <span>处理中 {counts.active}</span>
-              <span>可上架 {counts.ok}</span>
-              <span>不能上 {counts.rejected}</span>
-              <span>已上架 {counts.published}</span>
-            </div>
-          )}
-          {jobs.length === 0 && (
-            <div className="rounded-xl border border-dashed border-slate-300 p-10 text-center text-sm text-slate-500">
-              还没有任务。先在上面贴一个 1688 链接试试{!online && "（需要先连接 agent）"}。
-            </div>
-          )}
-          {jobs.map((j) => (
-            <JobCard key={j.id} job={j} onChange={load} />
-          ))}
-        </section>
-      )}
-
-      {tab === "setup" && (
-        <section className="rounded-2xl bg-white p-5 shadow-sm">
-          <SetupGuide />
-        </section>
-      )}
-
-      {tab === "rules" && (
-        <section className="rounded-2xl bg-white p-5 shadow-sm">
-          {config ? <SettingsPanel config={config} onSaved={setConfig} /> : <p className="text-sm text-slate-500">加载中…</p>}
-        </section>
-      )}
+      <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5">
+        <h2 className="font-semibold">第一次使用</h2>
+        <ol className="mt-3 list-decimal space-y-2 pl-5 text-sm text-slate-600">
+          <li>在 Windows 安装 Node.js 及 Chrome 或 Edge。</li>
+          <li>下载仓库 <code>public/agent</code> 目录中的文件到同一个文件夹，运行 <code>npm install</code>。</li>
+          <li>运行 <code>node agent.mjs login</code>，在弹出的浏览器里登录 1688 和拼多多商家后台。</li>
+          <li>复制上面的命令到该文件夹的 PowerShell 执行。首次先选“分析并填表”，人工核对后再提交。</li>
+        </ol>
+        <p className="mt-4 text-xs text-slate-500">浏览器登录态只留在本机的 chrome-profile 目录。不要把该目录上传到 GitHub。</p>
+      </section>
+      <section className="mt-6 rounded-2xl bg-slate-100 p-5 text-sm text-slate-600">
+        <h2 className="font-semibold text-slate-900">当前开发范围</h2>
+        <p className="mt-2">只做 1688 商品读取、SKU 定价与风险判断、拼多多表单填写。云端任务队列、数据库、账号体系、Token、订单采购、推广和客服暂不开发。</p>
+      </section>
     </main>
   );
 }
