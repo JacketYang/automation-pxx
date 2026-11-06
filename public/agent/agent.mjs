@@ -540,23 +540,28 @@ async function fillSkuTable(page, pricing) {
   const n = await tables.count();
   for (let t = 0; t < n; t++) {
     const table = tables.nth(t);
-    const heads = await table.locator("thead th, thead td").allInnerTexts().catch(() => []);
-    const idx = (re) => heads.findIndex((h) => re.test(h));
+    let heads = await table.locator("thead th, thead td").allInnerTexts().catch(() => []);
+    if (!heads.length) heads = await table.locator("tr").first().locator("th,td").allInnerTexts().catch(() => []);
+    const idx = (re) => heads.findIndex((h) => re.test(h.replace(/[*＊]/g, "").trim()));
     const gi = idx(/拼单价|团购价/), si = idx(/单买价/), ki = idx(/库存/);
     if (gi < 0 && ki < 0) continue;
-    const rows = table.locator("tbody tr");
+    let rows = table.locator("tbody tr");
+    if (!(await rows.count())) rows = table.locator("tr").filter({ has: page.locator("input") });
     const rc = await rows.count();
     let filled = 0;
     for (let r = 0; r < rc; r++) {
       const row = rows.nth(r);
       const text = await row.innerText().catch(() => "");
-      const sku = pricing.skus.length === 1 ? pricing.skus[0] : pricing.skus.find((s) => s.attrs.every((a) => text.includes(a)));
+      if (/拼单价|团购价/.test(text) && /单买价/.test(text)) continue;
+      const sku = pricing.skus.length === 1
+        ? pricing.skus[0]
+        : pricing.skus.find((s) => s.attrs?.length && s.attrs.every((a) => text.includes(a)));
       if (!sku) continue;
       const cells = row.locator("td");
       const setCell = async (i, val) => {
         if (i < 0) return;
-        const inp = cells.nth(i).locator("input:not([type=checkbox]):not([type=radio])").first();
-        if (await inp.count()) {
+        const inp = cells.nth(i).locator('input:not([type=checkbox]):not([type=radio]):not([type=hidden])').first();
+        if (await inp.count() && await inp.isVisible().catch(() => false)) {
           await inp.fill(String(val));
           filled++;
         }
@@ -573,26 +578,39 @@ async function fillSkuTable(page, pricing) {
 async function addSpecs(page, product, step) {
   const dims = product.dims.slice(0, 2);
   if (!dims.length || !product.skuRead) return;
-  for (const [i, d] of dims.entries()) {
-    await clickText(page, /添加规格|添加规格项/).catch(() => {});
-    await sleep(600);
-    const nameInputs = page.locator('input[placeholder*="规格名"], input[placeholder*="规格类型"], input[placeholder*="请选择规格"]');
+  const nameInputs = page.locator('input[placeholder*="规格类型"], input[placeholder*="规格名"], input[placeholder*="请选择规格"]');
+  const nameCount = await nameInputs.count();
+  const valueInputs = page.locator('input[placeholder*="规格值"], input[placeholder*="添加规格值"], input[placeholder*="输入规格"], input[placeholder*="自定义款式"], input[placeholder*="自定义组合"], input[placeholder="请输入"]');
+  let valueCursor = 0;
+  let added = 0;
+  for (let i = 0; i < dims.length; i++) {
+    const d = dims[i];
     const ni = nameInputs.nth(i);
-    if (await ni.isVisible().catch(() => false)) {
-      await ni.fill(d.name).catch(() => {});
-      await ni.press("Enter").catch(() => {});
-      await sleep(500);
+    if (i < nameCount && await ni.isVisible().catch(() => false)) {
+      const current = await ni.getAttribute("value").catch(() => "");
+      if (!current || current.startsWith("规格类型")) {
+        await ni.fill(d.name.slice(0, 20));
+        await ni.press("Enter").catch(() => {});
+      }
     }
-    const valInputs = page.locator('input[placeholder*="规格值"], input[placeholder*="添加规格值"], input[placeholder*="输入规格"]');
-    const vi = valInputs.nth(i);
+    // 兼容拼多多当前类目表单中的“自定义款式/自定义组合”规格值输入框。
+    let vi = valueInputs.nth(i);
+    if (!(await vi.isVisible().catch(() => false))) {
+      vi = valueInputs.nth(valueCursor);
+    }
+    if (!(await vi.isVisible().catch(() => false))) {
+      await step(`  ⚠ 规格「${d.name}」未找到可见规格值输入框，保留页面供人工检查`);
+      continue;
+    }
     for (const v of d.values.slice(0, 30)) {
-      if (!(await vi.isVisible().catch(() => false))) break;
-      await vi.fill(v.slice(0, 20)).catch(() => {});
+      await vi.fill(String(v).slice(0, 20));
       await vi.press("Enter").catch(() => {});
       await sleep(250);
+      added++;
     }
+    valueCursor++;
   }
-  await step(`  已尝试添加规格：${dims.map((d) => d.name).join(" / ")}`);
+  await step(`  规格录入完成：${dims.map((d) => d.name).join(" / ")}；已提交 ${added} 个规格值`);
   await sleep(1000);
 }
 
