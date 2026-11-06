@@ -2,12 +2,18 @@
 /**
  * 1688 → 拼多多 自动上架 agent（运行在你自己的电脑上）
  *
- * 用法：
- *   node agent.mjs login                      首次：打开浏览器，登录 1688 和 拼多多商家后台（登录态保存在 ./chrome-profile）
+  * 用法：
+ *   node agent.mjs start                      启动常驻 Chrome（调试端口 9222）+ 本机服务；首次会打印登录引导
+ *   node agent.mjs login                      连接已常驻的浏览器，打开 1688 / 拼多多登录页；登录完不关闭浏览器
  *   node agent.mjs check <1688链接>            只判断能不能上架
  *   node agent.mjs list  <1688链接>            判断 + 在拼多多后台填好表单（停在提交前，等你确认）
  *   node agent.mjs list  <1688链接> --submit   判断 + 填写 + 自动提交上架
  *   node agent.mjs inspect-pdd                打印拼多多发布页的表单结构（用于调试选择器）
+ *
+ * 浏览器常驻说明：
+ *   start 一旦启动就会把 Chrome 留在后台（不会因任务结束而关闭），登录态全程保留。
+ *   login / check / list / inspect-pdd 默认自动复用这个常驻浏览器（通过 9222 CDP 连接）。
+ *   只有当你手动关闭那个 Chrome 窗口后，登录态才会失效，需要重新 start + login。
  *
  * 通用参数：
  *   --profile <dir>    浏览器登录态目录，默认 ./chrome-profile
@@ -23,6 +29,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 
 const MAX_PRICE_MULTIPLE = 3.5;
 const UA =
@@ -106,33 +113,97 @@ async function waitForHuman(page, isDone, msg, step, timeoutMs = 10 * 60 * 1000)
 }
 
 // ───────────────────────── 浏览器 ─────────────────────────
+// 设计：把 Chrome 作为「独立后台进程」启动（带固定调试端口 9222 + 固定 profile），
+// 所有 agent 命令都通过 CDP 连上去复用它。任何命令退出都不会关闭浏览器，
+// 因此拼多多/1688 登录态全程保留 —— 这就是“登录持久”的关键。
+const CDP_PORT = 9222;
+const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
+const CHROME_PROFILE = () => path.resolve(flags.profile || "chrome-profile");
+
+// 定位系统里已安装的 Chrome / Edge
+function findChromeExe() {
+  const pf = process.env.ProgramFiles || "C:\\Program Files";
+  const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+  const local = process.env.LOCALAPPDATA || "";
+  const candidates = [];
+  if (flags.channel === "msedge") {
+    candidates.push(`${pf}\\Microsoft\\Edge\\Application\\msedge.exe`, `${pf86}\\Microsoft\\Edge\\Application\\msedge.exe`);
+  } else {
+    candidates.push(
+      `${pf}\\Google\\Chrome\\Application\\chrome.exe`,
+      `${pf86}\\Google\\Chrome\\Application\\chrome.exe`,
+      local ? `${local}\\Google\\Chrome\\Application\\chrome.exe` : "",
+      `${pf}\\Microsoft\\Edge\\Application\\msedge.exe`,
+      `${pf86}\\Microsoft\\Edge\\Application\\msedge.exe`
+    );
+  }
+  return candidates.filter(Boolean).find((p) => fs.existsSync(p)) || null;
+}
+
+// 9222 上是否已有可用的常驻浏览器
+async function cdpAlive() {
+  try {
+    const r = await fetch(`${CDP_URL}/json/version`, { signal: AbortSignal.timeout(1500) });
+    return r.ok;
+  } catch { return false; }
+}
+
+// 等独立 Chrome 把调试端口开出来
+async function waitCdpReady(timeoutMs = 20000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (await cdpAlive()) return true;
+    await sleep(300);
+  }
+  return false;
+}
+
+// 启动独立常驻 Chrome（detached，不随本 node 进程退出）
+async function launchPersistentChrome() {
+  const exe = findChromeExe();
+  if (!exe) throw new Error("找不到 Chrome / Edge 可执行文件，请安装 Chrome，或用 --channel msedge 指定");
+  const dir = CHROME_PROFILE();
+  fs.mkdirSync(dir, { recursive: true });
+  const args = [
+    `--remote-debugging-port=${CDP_PORT}`,
+    `--user-data-dir=${dir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--start-maximized",
+    "--disable-blink-features=AutomationControlled",
+    "about:blank",
+  ];
+  const child = spawn(exe, args, { detached: true, stdio: "ignore", windowsHide: false });
+  child.on("error", (e) => console.error("启动浏览器失败：", e.message));
+  child.unref(); // 关键：让 Chrome 脱离本进程独立存活
+  if (!(await waitCdpReady())) {
+    throw new Error(`Chrome 已启动但调试端口 ${CDP_PORT} 未就绪（可能已有别的 Chrome 占用了同一个 profile）`);
+  }
+}
+
+// 通过 CDP 连接常驻浏览器；close 为空操作，绝不关闭浏览器
+async function attachPersistent() {
+  const browser = await chromium.connectOverCDP(CDP_URL);
+  const context = browser.contexts()[0] || (await browser.newContext());
+  return { context, close: () => {}, owned: false };
+}
+
+// 显式 --cdp 参数：连接用户自己开的 Chrome（也不拥有）
+async function openBrowserExplicitCdp() {
+  const url = flags.cdp === true ? CDP_URL : flags.cdp;
+  const browser = await chromium.connectOverCDP(url);
+  const context = browser.contexts()[0] || (await browser.newContext());
+  return { context, close: () => {}, owned: false };
+}
+
+// 通用入口：确保有一个常驻浏览器，然后一律通过 CDP 复用。
+// 无论如何都不在命令结束时关闭浏览器。
 async function openBrowser() {
-  if (flags.cdp) {
-    const url = flags.cdp === true ? "http://127.0.0.1:9222" : flags.cdp;
-    const browser = await chromium.connectOverCDP(url);
-    const context = browser.contexts()[0] || (await browser.newContext());
-    return { context, close: () => browser.close() };
+  if (flags.cdp) return openBrowserExplicitCdp();
+  if (!await cdpAlive()) {
+    await launchPersistentChrome();
   }
-  const dir = path.resolve(flags.profile || "chrome-profile");
-  const channels = flags.channel ? [flags.channel] : ["chrome", "msedge"];
-  let lastErr;
-  for (const channel of channels) {
-    try {
-      const context = await chromium.launchPersistentContext(dir, {
-        channel,
-        headless: false,
-        viewport: null,
-        args: ["--start-maximized", "--disable-blink-features=AutomationControlled"],
-        ignoreDefaultArgs: ["--enable-automation"],
-      });
-      return { context, close: () => context.close() };
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw new Error(
-    "无法启动 Chrome / Edge（请确认已安装，且没有别的 Chrome 正在占用同一个 chrome-profile）：" + (lastErr?.message || "")
-  );
+  return attachPersistent();
 }
 
 // ───────────────────────── 1688 采集 ─────────────────────────
@@ -1172,21 +1243,23 @@ async function main() {
   }
 
   if (cmd === "login") {
-    const { context, close } = await openBrowser();
+    const { context } = await openBrowser();
     const p1 = await context.newPage();
     await p1.goto("https://login.1688.com/member/signin.htm", { waitUntil: "domcontentloaded" }).catch(() => {});
     const p2 = await context.newPage();
     await p2.goto("https://mms.pinduoduo.com/login/", { waitUntil: "domcontentloaded" }).catch(() => {});
-    console.log("\n请在弹出的浏览器里：\n  1) 登录 1688（采购账号）\n  2) 登录 拼多多商家后台\n登录完成后回到这里按回车。\n");
+    console.log("\n请在浏览器里：\n  1) 登录 1688（采购账号）\n  2) 登录 拼多多商家后台\n登录完成后回到这里按回车。\n");
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    await rl.question("都登录好了吗？按回车继续 ");
+    await rl.question("都登录好了吗？按回车继续 ")
     rl.close();
     const ck = await context.cookies("https://www.1688.com");
     console.log("1688 登录态：", ck.some((c) => c.name === "__cn_logon__" && c.value === "true") ? "✔ 已登录" : "⚠ 未检测到（可能 cookie 名变了，不一定有问题）");
     await p2.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
     await sleep(2500);
     console.log("拼多多登录态：", await isPddLoginRequired(p2) ? "⚠ 仍需要登录" : "✔ 未检测到登录拦截");
-    await close();
+    console.log("\n✔ 登录完成。浏览器保持打开，登录态已保留（不要关闭这个 Chrome 窗口）。");
+    console.log("   之后无论重开几个 agent 命令、或重启工作台，都会复用它，不需要重新登录。\n");
+    // 不调用 close()：常驻浏览器不随命令关闭，登录态持久。
     return;
   }
 
@@ -1196,12 +1269,15 @@ async function main() {
     let nextId = 1;
     let active = false;
     let context;
-    let browserClose;
+    // 本地部署：网页跑在 localhost 或自有域名（Cloudflare Tunnel 兜底），都放开。
+    // Agent 只监听 127.0.0.1，本身不暴露到公网。
     const allowedOrigin = (origin) => {
       if (!origin) return true;
       try {
         const u = new URL(origin);
-        return (u.protocol === "https:" && u.hostname.endsWith(".vercel.app")) || u.hostname === "localhost" || u.hostname === "127.0.0.1";
+        return u.hostname === "localhost" || u.hostname === "127.0.0.1" ||
+               u.hostname.endsWith(".fu8.cc.cd") || u.hostname === "fu8.cc.cd" ||
+               (u.protocol === "https:" && u.hostname.endsWith(".vercel.app"));
       } catch { return false; }
     };
     const server = createServer(async (req, res) => {
@@ -1265,8 +1341,18 @@ async function main() {
       try {
         const opened = await openBrowser();
         context = opened.context;
-        browserClose = opened.close;
-        context.on("close", () => { console.log("浏览器已关闭"); });
+        console.log(`✔ 常驻浏览器已就绪（调试端口 ${CDP_PORT}，登录态会一直保留，请勿关闭该 Chrome 窗口）`);
+        // 启动即检查拼多多是否已登录；未登录就地在常驻浏览器打开登录页，等人操作。
+        const probe = await context.newPage();
+        await probe.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+        await sleep(2000);
+        if (await isPddLoginRequired(probe)) {
+          console.log("\n⚠ 拼多多尚未登录。请在已打开的浏览器里完成登录（或另开一个终端运行：node agent.mjs login）。");
+          console.log("  登录完成后本服务会自动检测到，无需重启。\n");
+        } else {
+          console.log("✔ 拼多多登录态有效，可直接开始处理任务。");
+        }
+        await probe.close().catch(() => {});
         while (true) {
           const job = jobs.find(x => x.status === "queued");
           if (!job) { await sleep(700); continue; }
@@ -1291,7 +1377,7 @@ async function main() {
   }
 
   if (cmd === "inspect-pdd") {
-    const { context, close } = await openBrowser();
+    const { context } = await openBrowser();
     const page = await context.newPage();
     await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -1338,7 +1424,7 @@ async function main() {
     fs.mkdirSync(OUT, { recursive: true });
     fs.writeFileSync(path.join(OUT, "pdd-form.json"), JSON.stringify(info, null, 2), "utf8");
     console.log(`已保存 ${path.join(OUT, "pdd-form.json")}（包含所有打开页面及 iframe；未生成截图）`);
-    await close();
+    console.log("常驻浏览器保持打开，登录态继续保留。");
     return;
   }
 
@@ -1346,15 +1432,15 @@ async function main() {
     const id = parseOfferId(positional[0]);
     if (!id) throw new Error("请提供 1688 商品链接或商品 ID，例如：node agent.mjs check https://detail.1688.com/offer/123456789012.html");
     const mode = cmd === "check" ? "check" : flags.submit ? "publish" : "fill";
-    const { context, close } = await openBrowser();
+    const { context } = await openBrowser();
     const step = makeStep();
     const r = await runJob({ context, job: { offerId: id }, cfg: loadLocalConfig(), step, mode });
     printResult(r);
     if (r.status === "filled") {
-      console.log("浏览器已保留在发布页，请检查后手动提交。完成后按 Ctrl+C 退出。");
+      console.log("浏览器已保留在发布页，请检查后手动提交。常驻浏览器不会关闭，登录态继续保留。");
       await new Promise(() => {});
     }
-    await close();
+    console.log("常驻浏览器保持打开，登录态继续保留。");
     return;
   }
 

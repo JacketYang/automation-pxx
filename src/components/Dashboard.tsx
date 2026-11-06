@@ -62,10 +62,10 @@ export default function Dashboard() {
   const counts={running:jobs.filter(j=>["running","queued"].includes(j.status)).length,done:jobs.filter(j=>["eligible","filled","published"].includes(j.status)).length,blocked:jobs.filter(j=>["rejected","failed"].includes(j.status)).length};
   return <main className="mx-auto max-w-5xl px-4 py-8">
     <header className="mb-6 flex flex-wrap items-center gap-3">
-      <div><div className="text-sm font-medium text-blue-700">PXX · 第一阶段</div><h1 className="text-2xl font-bold">1688 商品分析 → 拼多多上架</h1><p className="mt-1 text-sm text-slate-500">网页直接连接本机 Agent，浏览器登录态保留在你的电脑。</p></div>
+      <div><div className="text-sm font-medium text-blue-700">PXX · 第一阶段 · 本地部署</div><h1 className="text-2xl font-bold">1688 商品分析 → 拼多多上架</h1><p className="mt-1 text-sm text-slate-500">网页与本机 Agent 都运行在你自己的电脑上，浏览器登录态一直保留，不会重复登录。</p></div>
       <div className={`ml-auto rounded-full px-4 py-2 text-sm font-medium ${online?"bg-emerald-100 text-emerald-800":"bg-red-100 text-red-700"}`}>{online?"● Agent 在线 · "+host:"● Agent 未连接"}</div>
     </header>
-    {!online&&<div className="mb-5 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">请先在电脑上启动一次本机 Agent（安装目录里的 <b>start-agent.bat</b>）。启动后此处会自动变成在线，不需要复制商品命令。</div>}
+    {!online&&<div className="mb-5 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">请先双击 <b>start-agent.bat</b> 启动本机 Agent（会同时拉起常驻浏览器）。首次使用先双击 <b>login-agent.bat</b> 登录 1688 和拼多多，之后浏览器保持打开，无需再登录。</div>}
     <section className="mb-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
       <div className="flex flex-wrap items-end gap-4">
         <div><h2 className="font-semibold">利润与投产比</h2><p className="mt-1 text-xs text-slate-500">这两项仍是硬门槛；修改后保存在本机。</p></div>
@@ -93,6 +93,6 @@ export default function Dashboard() {
         <details className="mt-3"><summary className="cursor-pointer text-xs text-slate-500">查看执行日志（{j.logs?.length||0}）</summary><div className="mt-2 max-h-48 overflow-auto rounded bg-slate-950 p-3 font-mono text-xs text-slate-100">{(j.logs||[]).map((l,i)=><div key={i}>{new Date(l.t).toLocaleTimeString()} {l.m}</div>)}</div></details>
       </article>)}</div>}
     </section>
-    <p className="mt-6 text-xs text-slate-400">本机服务仅监听 127.0.0.1:17368；商品页面和登录 Cookie 不会上传到 Vercel。网页需通过 HTTPS 打开。</p>
+    <p className="mt-6 text-xs text-slate-400">本机服务仅监听 127.0.0.1:17368；商品页面和登录 Cookie 全部保留在本机。常驻浏览器（调试端口 9222）不要关闭，登录态即可持续复用。</p>
   </main>;
 }

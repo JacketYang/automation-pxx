@@ -12,10 +12,10 @@ export default function SetupGuide() {
     </ul>
     <ol className="list-decimal space-y-2 pl-5">
       <li>安装 Node.js 18+ 和 Chrome 或 Edge。</li>
-      <li>首次在文件夹打开终端，运行 <code>npm install</code>，再运行 <code>node agent.mjs login</code>，登录 1688 和拼多多。</li>
-      <li>以后只需双击 <code>start-agent.bat</code>，不需要再输入商品命令。</li>
-      <li>回到本网页，右上角显示「Agent 在线」后，直接粘贴商品链接并点击开始处理。</li>
+      <li>首次在文件夹打开终端，运行 <code>npm install</code>，再双击 <code>login-agent.bat</code> 登录 1688 和拼多多。<b>登录完不要关闭那个浏览器窗口</b>。</li>
+      <li>以后只需双击 <code>start-agent.bat</code>：它会复用同一个常驻浏览器，登录态一直保留，不需要再登录。</li>
+      <li>在本机打开工作台网页（<code>http://localhost:3000</code>），右上角显示「Agent 在线」后，直接粘贴商品链接并点击开始处理。</li>
     </ol>
-    <p className="text-xs text-slate-500">Agent 只监听本机 127.0.0.1:17368。Cookie 和浏览器操作均保留在本机，不上传云端。关闭 Agent 窗口即可停止。</p>
+    <p className="text-xs text-slate-500">Agent 只监听本机 127.0.0.1:17368；常驻浏览器调试端口 9222。Cookie 和浏览器操作均保留在本机，不上传云端。只有关闭常驻浏览器才会清空登录态。</p>
   </div>;
 }
