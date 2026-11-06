@@ -653,7 +653,7 @@ async function pickCategory(page, context, pddTitle, cfg, step) {
 }
 
 async function armPddToastCapture(page) {
-  for ( (const frame of page.frames()) ) {
+  for (const frame of page.frames()) {
     await frame.evaluate(() => {
       window.__pxxToastMessages = [];
       const selectors = '[class*="toast"],[class*="Toast"],[class*="message"],[class*="Message"],[class*="notice"],[role="alert"],[aria-live]';
@@ -663,7 +663,7 @@ async function armPddToastCapture(page) {
         if (root.querySelectorAll) nodes.push(...root.querySelectorAll(selectors));
         for (const el of nodes) {
           if (!el.getClientRects().length) continue;
-          const text = (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 300);
+          const text = (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 300);
           if (text && !window.__pxxToastMessages.includes(text)) {
             window.__pxxToastMessages.push(text);
             if (window.__pxxToastMessages.length > 20) window.__pxxToastMessages.shift();
@@ -689,7 +689,7 @@ async function readPddToastMessages(page) {
     const found = await frame.evaluate(() => {
       const selectors = '[class*="toast"],[class*="Toast"],[class*="message"],[class*="Message"],[class*="notice"],[role="alert"],[aria-live]';
       const live = [...document.querySelectorAll(selectors)].filter((el) => el.getClientRects().length)
-        .map((el) => (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 300)).filter(Boolean);
+        .map((el) => (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 300)).filter(Boolean);
       return [...(window.__pxxToastMessages || []), ...live].slice(-20);
     }).catch(() => []);
     messages.push(...found);
