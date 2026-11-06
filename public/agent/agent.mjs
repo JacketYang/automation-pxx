@@ -687,7 +687,8 @@ async function uploadCategoryCover(page, imagePath, step) {
           chain
         };
       }).catch((e) => ({ error: e.message, accept: "", chain: [] }));
-      const contextText = [info.labelText, ...(info.chain || []).map(x => x.text)].join(" ");
+      const localChain = (info.chain || []).slice(0, 3);
+      const contextText = [info.labelText, ...localChain.map(x => x.text)].join(" ");
       const imageAccept = /image/i.test(info.accept || "");
       const imageContext = /主图|首图|商品图片|上传图片|图片上传|商品首图/.test(contextText);
       const excludedContext = /视频|详情图|轮播图|资质|包装标签/.test(contextText);
@@ -752,7 +753,7 @@ async function uploadCategoryCover(page, imagePath, step) {
       }
       attempts.push({
         frameUrl: frame.url(), index, accept: info.accept, labelText: info.labelText,
-        parentText: (info.chain || []).map(x => x.text).filter(Boolean).slice(0, 3),
+        parentText: (info.chain || []).slice(0, 3).map(x => x.text).filter(Boolean),
         reason: "文件已绑定，但上传区域未出现新图片/上传完成状态", fileState
       });
     } catch (e) {
