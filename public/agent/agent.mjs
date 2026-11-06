@@ -1,0 +1,919 @@
+#!/usr/bin/env node
+/**
+ * 1688 → 拼多多 自动上架 agent（运行在你自己的电脑上）
+ *
+ * 用法：
+ *   node agent.mjs login                      首次：打开浏览器，登录 1688 和 拼多多商家后台（登录态保存在 ./chrome-profile）
+ *   node agent.mjs check <1688链接>            只判断能不能上架
+ *   node agent.mjs list  <1688链接>            判断 + 在拼多多后台填好表单（停在提交前，等你确认）
+ *   node agent.mjs list  <1688链接> --submit   判断 + 填写 + 自动提交上架
+ *   node agent.mjs watch --server <网页地址>   接入网页控制台：在网页里贴链接，这里自动处理
+ *   node agent.mjs inspect-pdd                打印拼多多发布页的表单结构（用于调试选择器）
+ *
+ * 通用参数：
+ *   --profile <dir>    浏览器登录态目录，默认 ./chrome-profile
+ *   --cdp [url]        连接已经开着的 Chrome（--remote-debugging-port=9222），不再自己启动
+ *   --channel <name>   chrome / msedge，默认依次尝试
+ *   --category <词>    指定拼多多类目搜索词
+ *   --config <file>    本地 JSON，覆盖默认的加价/违禁词等规则（不接网页时用）
+ *   --out <dir>        图片和截图输出目录，默认 ./output
+ */
+import { chromium } from "playwright-core";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import readline from "node:readline/promises";
+
+const VERSION = "1.0.0";
+const MAX_PRICE_MULTIPLE = 3.5;
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// ───────────────────────── 参数 ─────────────────────────
+const argv = process.argv.slice(2);
+const cmd = argv[0] && !argv[0].startsWith("--") ? argv[0] : "help";
+const flags = {};
+const positional = [];
+for (let i = 1; i < argv.length; i++) {
+  const a = argv[i];
+  if (a.startsWith("--")) {
+    const k = a.slice(2);
+    const n = argv[i + 1];
+    if (n === undefined || n.startsWith("--")) flags[k] = true;
+    else {
+      flags[k] = n;
+      i++;
+    }
+  } else positional.push(a);
+}
+const OUT = path.resolve(flags.out || "output");
+
+const DEFAULTS = {
+  markupPercent: 30,
+  shippingCost: 2.5,
+  fixedCost: 0,
+  pddFeePercent: 0.6,
+  minProfit: 2,
+  maxMinOrder: 1,
+  singleBuyExtra: 1,
+  defaultStock: 100,
+  promiseHours: 48,
+  shippingTemplate: "",
+  categoryHint: "",
+  allowWarn: true,
+  requireDropship: false,
+  bannedKeywords: ["香烟", "电子烟", "处方药", "药品", "成人用品", "情趣", "仿真枪", "管制刀具", "匕首", "医疗器械", "美瞳", "烟花", "高仿", "仿牌"],
+  brandKeywords: ["耐克", "nike", "阿迪达斯", "adidas", "苹果", "iphone", "华为", "小米", "路易威登", "gucci", "chanel", "迪奥", "爱马仕", "迪士尼", "乐高", "lego"],
+  warnKeywords: ["食品", "零食", "保健", "化妆", "护肤", "面膜", "婴儿", "玩具", "充电", "电池", "插座", "电器", "灯"],
+};
+const EXTREME_WORDS = [
+  "最", "第一", "唯一", "顶级", "极致", "国家级", "全网", "首个", "独家", "绝对", "100%", "百分百", "史上", "万能",
+  "特效", "包治", "永久", "秒杀", "全球", "世界级", "极品", "无敌", "正品", "官方", "旗舰", "驰名", "免检", "特供", "专供",
+  "爆款", "清仓", "批发", "厂家", "工厂", "直销", "一件代发", "代发", "跨境", "1688", "淘宝", "天猫", "京东", "拼多多", "现货", "定制", "热卖", "货源",
+];
+
+// ───────────────────────── 小工具 ─────────────────────────
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const round2 = (n) => Math.round(n * 100) / 100;
+const uniq = (a) => [...new Set(a)];
+const ts = () => new Date().toLocaleTimeString();
+
+function makeStep(server, jobId) {
+  const post = async (patch) => {
+    if (!server || !jobId) return;
+    try {
+      await fetch(`${server}/api/agent/jobs/${jobId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+    } catch (e) {
+      console.error(`[${ts()}] 回报失败: ${e.message}`);
+    }
+  };
+  const step = async (msg, patch = {}) => {
+    console.log(`[${ts()}] ${msg}`);
+    await post({ log: msg, ...patch });
+  };
+  step.report = post;
+  return step;
+}
+
+async function waitForHuman(page, isDone, msg, step, timeoutMs = 10 * 60 * 1000) {
+  await step(`⏸ 需要你在弹出的浏览器里操作：${msg}`, { stage: `等待你操作：${msg}` });
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (await isDone().catch(() => false)) {
+      await step("▶ 检测到已完成，继续");
+      return;
+    }
+    await sleep(1500);
+  }
+  throw new Error(`等待人工操作超时：${msg}`);
+}
+
+// ───────────────────────── 浏览器 ─────────────────────────
+async function openBrowser() {
+  if (flags.cdp) {
+    const url = flags.cdp === true ? "http://127.0.0.1:9222" : flags.cdp;
+    const browser = await chromium.connectOverCDP(url);
+    const context = browser.contexts()[0] || (await browser.newContext());
+    return { context, close: () => browser.close() };
+  }
+  const dir = path.resolve(flags.profile || "chrome-profile");
+  const channels = flags.channel ? [flags.channel] : ["chrome", "msedge"];
+  let lastErr;
+  for (const channel of channels) {
+    try {
+      const context = await chromium.launchPersistentContext(dir, {
+        channel,
+        headless: false,
+        viewport: null,
+        args: ["--start-maximized", "--disable-blink-features=AutomationControlled"],
+        ignoreDefaultArgs: ["--enable-automation"],
+      });
+      return { context, close: () => context.close() };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(
+    "无法启动 Chrome / Edge（请确认已安装，且没有别的 Chrome 正在占用同一个 chrome-profile）：" + (lastErr?.message || "")
+  );
+}
+
+// ───────────────────────── 1688 采集 ─────────────────────────
+async function gate1688(page, context, step) {
+  const blocked = async () => {
+    const url = page.url();
+    if (/login\.(1688|taobao)\.com|passport\.1688\.com|havanaone|\/member\/login/.test(url)) return "登录 1688";
+    if (/punish|_____tmd_____|x5secdata|captcha/.test(url)) return "完成滑块验证";
+    const head = await page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
+    if (/请拖动下方滑块|请按住滑块|滑动验证|验证码拦截|Access Denied/.test(head.slice(0, 2000))) return "完成滑块验证";
+    for (const f of page.frames()) {
+      if (f === page.mainFrame()) continue;
+      const t = await f.locator("body").innerText({ timeout: 800 }).catch(() => "");
+      if (/请拖动下方滑块|请按住滑块/.test(t)) return "完成滑块验证";
+    }
+    return null;
+  };
+  const why = await blocked();
+  if (!why) return;
+  await waitForHuman(page, async () => !(await blocked()), `1688 需要你${why}`, step);
+  await sleep(2500);
+}
+
+/** 在页面内执行：尽可能从页面全局数据 + DOM 里拿到商品信息 */
+function scrapePage() {
+  const out = {
+    title: "", titleDom: "", images: [], domImages: [], detailImages: [], skuProps: [], skuMap: null,
+    tiers: [], minOrderField: null, descUrl: "", attrs: {}, seller: "", text: "", domPrices: [], stockField: null,
+  };
+  const imgKey = /^(offerImgList|imageList|imgList|images|mainImages|mainImageList|gallery|galleryList|offerImages)$/i;
+  const tierKey = /^(priceRanges|priceRange|offerPriceRanges|priceTierList|currentPrices)$/i;
+  const pickImg = (it) =>
+    typeof it === "string"
+      ? it
+      : it && (it.fullPathImageURI || it.originalImageURI || it.imageURI || it.imgUrl || it.url || it.fullPath || it.src || it.big || it.original || it.imageUrl);
+  const seen = new WeakSet();
+  let count = 0;
+  function walk(o, depth) {
+    if (!o || typeof o !== "object" || depth > 14 || count > 300000 || seen.has(o)) return;
+    if (typeof Node !== "undefined" && o instanceof Node) return;
+    if (o === window) return;
+    seen.add(o);
+    let keys;
+    try { keys = Object.keys(o); } catch { return; }
+    for (const k of keys) {
+      count++;
+      let v;
+      try { v = o[k]; } catch { continue; }
+      if (typeof v === "string") {
+        if (/^(subject|offerTitle|productTitle)$/.test(k) && v.length > 4 && !out.title) out.title = v;
+        else if (/^(detailUrl|descUrl)$/.test(k) && /^(https?:)?\/\//.test(v) && !out.descUrl) out.descUrl = v;
+        else if (/^(sellerLoginId|companyName)$/.test(k) && !out.seller) out.seller = v;
+      } else if (typeof v === "number") {
+        if (/^(minOrderQuantity|minOrderQty)$/.test(k) && out.minOrderField === null) out.minOrderField = v;
+        if (/^(canBookCount|totalCanBookCount)$/.test(k) && out.stockField === null) out.stockField = v;
+      } else if (Array.isArray(v)) {
+        if (imgKey.test(k)) {
+          for (const it of v) { const u = pickImg(it); if (u) out.images.push(u); }
+        } else if (tierKey.test(k)) {
+          for (const it of v) {
+            if (it && typeof it === "object")
+              out.tiers.push({ begin: Number(it.beginAmount ?? it.startQuantity ?? it.begin ?? it.quantity ?? 1), price: Number(it.price ?? it.discountPrice ?? it.value) });
+          }
+        } else if (k === "skuProps" && !out.skuProps.length) {
+          out.skuProps = v.map((p) => ({
+            prop: String(p.prop || p.name || ""),
+            value: (p.value || []).map((x) => ({ name: String(x.name || x.value || ""), imageUrl: x.imageUrl || x.imgUrl || "" })),
+          }));
+        } else if (/^(attributes|featureAttributes|productFeatureList|offerAttributes)$/.test(k)) {
+          for (const it of v) {
+            const n = it && (it.name || it.attributeName || it.fid);
+            const val = it && (it.value || it.attributeValue || it.values);
+            if (n && val) out.attrs[String(n)] = String(Array.isArray(val) ? val.join(",") : val);
+          }
+        }
+      } else if (v && typeof v === "object" && /^(skuInfoMap|skuMap)$/.test(k) && !Array.isArray(v) && !out.skuMap) {
+        out.skuMap = {};
+        for (const [sk, x] of Object.entries(v)) {
+          if (x && typeof x === "object")
+            out.skuMap[sk] = { price: x.discountPrice ?? x.price ?? null, canBookCount: x.canBookCount ?? x.stock ?? null, skuId: x.skuId ?? null };
+        }
+      }
+      if (v && typeof v === "object") walk(v, depth + 1);
+    }
+  }
+  for (const k of ["context", "__INIT_DATA", "__INITIAL_STATE__", "__GLOBAL_DATA", "__STORE_DATA__"]) {
+    try { if (window[k]) walk(window[k], 0); } catch { /* ignore */ }
+  }
+  const imgSrc = (i) => i.getAttribute("data-lazyload-src") || i.getAttribute("data-src") || i.getAttribute("data-lazy-src") || i.currentSrc || i.src;
+  out.titleDom = (document.querySelector("h1")?.innerText || document.title || "").replace(/\s*[-_—]\s*(阿里巴巴|1688).*$/, "").trim();
+  const gallerySel = '[class*="gallery"] img, [class*="Gallery"] img, [class*="mainImg"] img, [class*="offerImg"] img, [class*="od-gallery"] img, [class*="img-list"] img, [class*="thumb"] img';
+  document.querySelectorAll(gallerySel).forEach((i) => out.domImages.push(imgSrc(i)));
+  const og = document.querySelector('meta[property="og:image"]')?.content;
+  if (og) out.domImages.push(og);
+  const detailSel = '#detailContentContainer img, #description img, #desc-lazyload-container img, [class*="detail-desc"] img, [class*="html-description"] img, [class*="description"] img, [class*="od-pc-offer-description"] img, [id*="desc"] img';
+  document.querySelectorAll(detailSel).forEach((i) => out.detailImages.push(imgSrc(i)));
+  document.querySelectorAll('[class*="price"], [class*="Price"]').forEach((e) => {
+    const m = (e.innerText || "").match(/[¥￥]\s*(\d+(?:\.\d{1,2})?)/g);
+    if (m) m.slice(0, 4).forEach((x) => out.domPrices.push(parseFloat(x.replace(/[^\d.]/g, ""))));
+  });
+  out.text = (document.body.innerText || "").slice(0, 30000);
+  return out;
+}
+
+const normImg = (u) => {
+  if (!u || typeof u !== "string") return null;
+  u = u.trim();
+  if (u.startsWith("//")) u = "https:" + u;
+  if (!/^https?:\/\//.test(u)) return null;
+  if (!/alicdn\.com|aliimg\.com|1688\.com/.test(u)) return null;
+  if (/\.(gif|svg)(\?|$)/i.test(u)) return null;
+  const tps = u.match(/tps-(\d+)-(\d+)/);
+  if (tps && (+tps[1] < 300 || +tps[2] < 300)) return null; // 图标/小横幅
+  if (/sprite|logo|avatar|icon/i.test(u)) return null;
+  u = u.replace(/(\.(?:jpg|jpeg|png))_[^/]*$/i, "$1").replace(/_\d+x\d+(?:q\d+)?\.(jpg|jpeg|png|webp)$/i, ".$1");
+  return u;
+};
+
+async function extract1688(page, context, offerId, step) {
+  const url = `https://detail.1688.com/offer/${offerId}.html`;
+  await step(`打开 1688 商品页 ${url}`, { stage: "读取 1688 商品" });
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await gate1688(page, context, step);
+  await sleep(3000);
+  for (let i = 0; i < 10; i++) {
+    await page.mouse.wheel(0, 1400);
+    await sleep(450);
+  }
+  await gate1688(page, context, step);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const raw = await page.evaluate(scrapePage);
+
+  // 详情长图：有时在单独的 desc 接口里
+  let descImgs = [];
+  if (raw.descUrl) {
+    try {
+      const html = await page.evaluate(async (u) => (await fetch(u.startsWith("//") ? "https:" + u : u)).text(), raw.descUrl);
+      descImgs = [...html.matchAll(/src=\\?["']([^"'\\]+)/g)].map((m) => m[1]);
+    } catch { /* ignore */ }
+  }
+
+  const text = raw.text || "";
+  const unavailable = /商品已下架|该商品已失效|offer已下架|商品已过期|商品不存在|您访问的页面不存在|没有找到相关/.test(text.slice(0, 4000));
+
+  // 图片
+  const gallery = uniq([...raw.images, ...raw.domImages].map(normImg).filter(Boolean)).slice(0, 10);
+  const detailImages = uniq([...raw.detailImages, ...descImgs].map(normImg).filter(Boolean)).filter((u) => !gallery.includes(u)).slice(0, 30);
+
+  // 规格
+  const dims = (raw.skuProps || []).filter((d) => d.prop && d.value.length).slice(0, 3);
+  const baseTier = raw.tiers.filter((t) => t.price > 0).sort((a, b) => a.begin - b.begin)[0];
+  const domMin = raw.domPrices.filter((n) => n > 0).sort((a, b) => a - b)[0];
+  let baseCost = baseTier?.price || domMin || 0;
+  const skus = [];
+  if (raw.skuMap) {
+    for (const [key, v] of Object.entries(raw.skuMap)) {
+      const attrs = key.split(/&gt;|>/).map((s) => s.trim()).filter(Boolean);
+      const price = parseFloat(v.price);
+      const img = dims[0]?.value.find((x) => x.name === attrs[0])?.imageUrl || "";
+      skus.push({ name: attrs.join(" / "), attrs, cost: price > 0 ? price : baseCost, stock: Number(v.canBookCount) || 0, image: normImg(img) || "" });
+    }
+  }
+  if (!baseCost && skus.length) baseCost = Math.min(...skus.map((s) => s.cost).filter((n) => n > 0));
+
+  // 起批量
+  let minOrder = null;
+  if (raw.tiers.length) minOrder = Math.min(...raw.tiers.map((t) => t.begin).filter((n) => n > 0));
+  if (!minOrder && raw.minOrderField) minOrder = raw.minOrderField;
+  if (!minOrder) {
+    const m = text.match(/(\d+)\s*[\u4e00-\u9fa5]{1,2}\s*起批/) || text.match(/≥\s*(\d+)/);
+    if (m) minOrder = parseInt(m[1], 10);
+  }
+
+  // 服务标签
+  const hours = [...text.matchAll(/(\d+)\s*小时\s*(?:内)?\s*发货/g)].map((m) => parseInt(m[1], 10));
+  if (/当天发货|当日发货|次日发/.test(text)) hours.push(24);
+  const flags2 = {
+    dropship: /一件代发|支持代发|代发/.test(text.slice(0, 12000)),
+    sevenDay: /7天(?:无理由|包换)|七天无理由/.test(text),
+    freeShip: /包邮/.test(text.slice(0, 12000)),
+    shipHours: hours.length ? Math.min(...hours) : null,
+  };
+
+  const title = (raw.title || raw.titleDom || "").trim();
+  const product = {
+    offerId,
+    url,
+    title,
+    seller: raw.seller,
+    unavailable,
+    cost: round2(baseCost || 0),
+    minOrder,
+    stock: raw.stockField ?? (skus.length ? skus.reduce((a, s) => a + s.stock, 0) : null),
+    gallery,
+    detailImages,
+    dims: dims.map((d) => ({ name: d.prop, values: d.value.map((v) => v.name) })),
+    skus,
+    attrs: raw.attrs,
+    flags: flags2,
+    tiers: raw.tiers.filter((t) => t.price > 0),
+    skuRead: skus.length > 0,
+  };
+  await step(
+    `读取完成：标题「${title.slice(0, 30)}」成本 ¥${product.cost} 主图 ${gallery.length} 详情图 ${detailImages.length} 规格 ${skus.length}`
+  );
+  return product;
+}
+
+// ───────────────────────── 判断 + 定价 ─────────────────────────
+const hit = (hay, kw) => {
+  const k = kw.toLowerCase();
+  if (/^[a-z0-9 :]+$/.test(k)) return new RegExp(`(^|[^a-z0-9])${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`).test(hay);
+  return hay.includes(k);
+};
+
+function priceSku(cost, cfg) {
+  const base = cost + cfg.shippingCost + cfg.fixedCost;
+  // 取“按加价率”和“保证最低利润”两者中较高的价格
+  const byMarkup = base * (1 + cfg.markupPercent / 100);
+  const byProfit = (base + cfg.minProfit) / (1 - cfg.pddFeePercent / 100);
+  const group = Math.ceil(Math.max(byMarkup, byProfit) * 10) / 10;
+  const profit = group * (1 - cfg.pddFeePercent / 100) - base;
+  const single = round2(group + cfg.singleBuyExtra);
+  return { cost: round2(cost), group: round2(group), single, market: Math.ceil(single * 1.5), profit: round2(profit) };
+}
+
+function evaluate(p, cfg) {
+  const reasons = [];
+  const add = (level, code, msg) => reasons.push({ level, code, msg });
+
+  if (p.unavailable) add("block", "unavailable", "1688 商品已下架/失效，或页面不存在");
+  if (!p.title) add("block", "no_title", "没读到商品标题（可能被验证页拦截）");
+  if (p.gallery.length === 0) add("block", "no_images", "没读到商品主图");
+  else if (p.gallery.length < 3) add("warn", "few_images", `主图只有 ${p.gallery.length} 张，拼多多要求至少 3 张，会用 SKU 图/详情图补`);
+  if (!(p.cost > 0)) add("block", "no_price", "没读到价格");
+  if (p.minOrder && p.minOrder > cfg.maxMinOrder) add("block", "min_order", `起批量 ${p.minOrder}，一件代发需要 ${cfg.maxMinOrder} 件起批`);
+
+  const hay = [p.title, ...Object.values(p.attrs || {}), ...p.skus.map((s) => s.name)].join(" ").toLowerCase();
+  const bad = cfg.bannedKeywords.filter((k) => hit(hay, k));
+  if (bad.length) add("block", "banned", `命中拼多多违禁/禁售词：${bad.join("、")}`);
+  const brands = cfg.brandKeywords.filter((k) => hit(hay, k));
+  if (brands.length) add("block", "brand", `含品牌词：${brands.join("、")}（无授权会侵权）`);
+  const warns = cfg.warnKeywords.filter((k) => hit(hay, k));
+  if (warns.length) add("warn", "qualification", `可能需要类目资质/3C/备案：${warns.join("、")}`);
+  const brandAttr = p.attrs?.["品牌"];
+  if (brandAttr && !/^(无|无品牌|其他|其它|不详|暂无|-)$/.test(brandAttr.trim()) && !brands.length)
+    add("warn", "brand_attr", `1688 属性里品牌=「${brandAttr}」，拼多多品牌需授权，上架会填“无品牌”`);
+
+  if (!p.flags.sevenDay) add("warn", "no_7day", "页面没看到“7天无理由”，拼多多多数类目强制要求");
+  if (p.flags.shipHours && p.flags.shipHours > cfg.promiseHours)
+    add("block", "ship_slow", `货源发货时效 ${p.flags.shipHours} 小时，超过你承诺的 ${cfg.promiseHours} 小时`);
+  if (!p.flags.dropship) add(cfg.requireDropship ? "block" : "warn", "no_dropship", "页面没出现“一件代发”字样，请先和商家确认支持代发");
+  if (p.dims.length > 2) add("warn", "many_dims", `规格维度 ${p.dims.length} 个，拼多多最多 2 个，需手动合并`);
+  if (p.skus.length > 50) add("warn", "many_skus", `SKU ${p.skus.length} 个，较多`);
+  if (!p.skuRead) add("warn", "sku_unread", "没读到规格明细，按单规格处理（有多规格的话需要手动补）");
+  if (p.stock === 0) add("block", "no_stock", "货源库存为 0");
+  else if (p.stock != null && p.stock < 10) add("warn", "low_stock", `货源库存只有 ${p.stock}`);
+
+  // 定价
+  const list = p.skus.length ? p.skus : [{ name: "默认", attrs: ["默认"], cost: p.cost, stock: p.stock || 0, image: "" }];
+  const skuPricing = list.map((s) => {
+    const pr = priceSku(s.cost > 0 ? s.cost : p.cost, cfg);
+    return { name: s.name, attrs: s.attrs, image: s.image, stock: Math.max(1, Math.min(cfg.defaultStock, s.stock > 0 ? s.stock : cfg.defaultStock)), ...pr };
+  });
+  const minProfit = Math.min(...skuPricing.map((s) => s.profit));
+  const worst = Math.max(...skuPricing.map((s) => s.group / Math.max(s.cost, 0.01)));
+  if (p.cost > 0 && worst > MAX_PRICE_MULTIPLE)
+    add("block", "low_margin", `成本太低：要卖到成本的 ${round2(worst)} 倍（含快递 ¥${cfg.shippingCost}）才能赚到 ¥${cfg.minProfit}，价格没有竞争力`);
+  const pricing = { skus: skuPricing, minProfit: round2(minProfit), maxGroup: Math.max(...skuPricing.map((s) => s.group)) };
+
+  const verdict = reasons.some((r) => r.level === "block") ? "blocked" : reasons.some((r) => r.level === "warn") ? "warn" : "ok";
+  if (verdict === "ok") add("info", "ok", "未发现问题，可以上架");
+  return { verdict, canList: verdict === "ok" || (verdict === "warn" && cfg.allowWarn), reasons, pricing };
+}
+
+function buildPddTitle(title) {
+  let t = title;
+  for (const w of EXTREME_WORDS) t = t.split(w).join(" ");
+  t = t.replace(/[【】\[\]()（）{}<>《》|丨\/\\,，。!！?？~～·•★☆♥❤✔✓+_:：;；"'“”‘’]/g, " ").replace(/\s+/g, " ").trim();
+  const width = (s) => [...s].reduce((a, c) => a + (/[\u0000-\u00ff]/.test(c) ? 1 : 2), 0);
+  if (t.length < 4) t = title.replace(/\s+/g, " ").trim();
+  let out = "";
+  for (const c of t) {
+    if (width(out + c) > 60) break;
+    out += c;
+  }
+  return out.trim();
+}
+
+// ───────────────────────── 图片下载 ─────────────────────────
+async function downloadImages(urls, dir, prefix, step) {
+  fs.mkdirSync(dir, { recursive: true });
+  const files = [];
+  let n = 0;
+  for (const u of urls) {
+    try {
+      const r = await fetch(u, { headers: { "user-agent": UA, referer: "https://detail.1688.com/" } });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length < 3000) continue;
+      const ct = r.headers.get("content-type") || "";
+      const ext = /png/.test(ct) ? "png" : /webp/.test(ct) ? "webp" : "jpg";
+      const f = path.join(dir, `${prefix}${String(++n).padStart(2, "0")}.${ext}`);
+      fs.writeFileSync(f, buf);
+      files.push(f);
+    } catch (e) {
+      await step(`图片下载失败 ${u.slice(-40)}：${e.message}`);
+    }
+  }
+  return files;
+}
+
+// ───────────────────────── 拼多多后台 ─────────────────────────
+const PDD_CATEGORY_URL = "https://mms.pinduoduo.com/goods/category";
+const isFormUrl = (u) => /goods_add|goods_edit|goods\/edit|goods\/add/.test(u);
+
+async function clickText(page, re, timeout = 4000) {
+  const cands = [
+    page.getByRole("button", { name: re }),
+    page.locator("button,a,[role=button],[class*=btn],[class*=Btn]").filter({ hasText: re }),
+    page.getByText(re),
+  ];
+  for (const c of cands) {
+    const l = c.first();
+    if (await l.isVisible().catch(() => false)) {
+      await l.click({ timeout }).catch(() => {});
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 从文字标签向上找最近的、包含 innerSel 元素的容器，并给目标元素打标记 */
+async function tagNear(page, labelRe, innerSel, visibleOnly = true) {
+  return page.evaluate(
+    ({ src, innerSel, visibleOnly }) => {
+      const re = new RegExp(src);
+      document.querySelectorAll("[data-agent-t]").forEach((e) => e.removeAttribute("data-agent-t"));
+      const cands = [...document.querySelectorAll("label,span,div,p,td,th,h1,h2,h3,h4,b,strong")].filter((e) => {
+        const t = (e.innerText || "").trim();
+        return e.children.length <= 3 && t.length > 0 && t.length < 24 && re.test(t);
+      });
+      for (const c of cands) {
+        let n = c;
+        for (let i = 0; i < 8 && n; i++) {
+          n = n.parentElement;
+          if (!n) break;
+          const found = [...n.querySelectorAll(innerSel)].find((x) => !visibleOnly || x.getClientRects().length > 0);
+          if (found) {
+            found.setAttribute("data-agent-t", "1");
+            return true;
+          }
+        }
+      }
+      return false;
+    },
+    { src: labelRe.source, innerSel, visibleOnly }
+  );
+}
+
+const TEXT_INPUT = "input:not([type=file]):not([type=hidden]):not([type=radio]):not([type=checkbox]),textarea";
+
+async function fillByLabel(page, labelRe, value) {
+  if (!(await tagNear(page, labelRe, TEXT_INPUT, true))) throw new Error(`找不到输入框：${labelRe}`);
+  const el = page.locator('[data-agent-t="1"]').first();
+  await el.scrollIntoViewIfNeeded().catch(() => {});
+  await el.fill(String(value));
+}
+
+async function uploadByLabel(page, labelRe, files, step) {
+  if (!files.length) throw new Error("没有可上传的图片");
+  if (!(await tagNear(page, labelRe, "input[type=file]", false))) throw new Error(`找不到上传控件：${labelRe}`);
+  const el = page.locator('[data-agent-t="1"]').first();
+  const multiple = await el.getAttribute("multiple").catch(() => null);
+  if (multiple !== null) await el.setInputFiles(files);
+  else
+    for (const f of files) {
+      if (!(await tagNear(page, labelRe, "input[type=file]", false))) break;
+      await page.locator('[data-agent-t="1"]').first().setInputFiles(f);
+      await sleep(1800);
+    }
+  await sleep(2500 + files.length * 700);
+  await step(`  已上传 ${files.length} 张（${labelRe.source}）`);
+}
+
+async function fillSkuTable(page, pricing) {
+  const tables = page.locator("table");
+  const n = await tables.count();
+  for (let t = 0; t < n; t++) {
+    const table = tables.nth(t);
+    const heads = await table.locator("thead th, thead td").allInnerTexts().catch(() => []);
+    const idx = (re) => heads.findIndex((h) => re.test(h));
+    const gi = idx(/拼单价|团购价/), si = idx(/单买价/), ki = idx(/库存/);
+    if (gi < 0 && ki < 0) continue;
+    const rows = table.locator("tbody tr");
+    const rc = await rows.count();
+    let filled = 0;
+    for (let r = 0; r < rc; r++) {
+      const row = rows.nth(r);
+      const text = await row.innerText().catch(() => "");
+      const sku = pricing.skus.length === 1 ? pricing.skus[0] : pricing.skus.find((s) => s.attrs.every((a) => text.includes(a)));
+      if (!sku) continue;
+      const cells = row.locator("td");
+      const setCell = async (i, val) => {
+        if (i < 0) return;
+        const inp = cells.nth(i).locator("input:not([type=checkbox]):not([type=radio])").first();
+        if (await inp.count()) {
+          await inp.fill(String(val));
+          filled++;
+        }
+      };
+      await setCell(gi, sku.group);
+      await setCell(si, sku.single);
+      await setCell(ki, sku.stock);
+    }
+    if (filled) return filled;
+  }
+  return 0;
+}
+
+async function addSpecs(page, product, step) {
+  const dims = product.dims.slice(0, 2);
+  if (!dims.length || !product.skuRead) return;
+  for (const [i, d] of dims.entries()) {
+    await clickText(page, /添加规格|添加规格项/).catch(() => {});
+    await sleep(600);
+    const nameInputs = page.locator('input[placeholder*="规格名"], input[placeholder*="规格类型"], input[placeholder*="请选择规格"]');
+    const ni = nameInputs.nth(i);
+    if (await ni.isVisible().catch(() => false)) {
+      await ni.fill(d.name).catch(() => {});
+      await ni.press("Enter").catch(() => {});
+      await sleep(500);
+    }
+    const valInputs = page.locator('input[placeholder*="规格值"], input[placeholder*="添加规格值"], input[placeholder*="输入规格"]');
+    const vi = valInputs.nth(i);
+    for (const v of d.values.slice(0, 30)) {
+      if (!(await vi.isVisible().catch(() => false))) break;
+      await vi.fill(v.slice(0, 20)).catch(() => {});
+      await vi.press("Enter").catch(() => {});
+      await sleep(250);
+    }
+  }
+  await step(`  已尝试添加规格：${dims.map((d) => d.name).join(" / ")}`);
+  await sleep(1000);
+}
+
+async function pickCategory(page, context, pddTitle, cfg, step) {
+  const kws = [flags.category, cfg.categoryHint, pddTitle.slice(0, 30), pddTitle.slice(-8), pddTitle.slice(0, 8)].filter(Boolean);
+  const input = page
+    .locator('input[placeholder*="类目"], input[placeholder*="商品名称"], input[placeholder*="搜索"], input[placeholder*="关键"]')
+    .first();
+  let picked = false;
+  for (const kw of kws) {
+    if (!(await input.isVisible().catch(() => false))) break;
+    await step(`  搜索类目：${kw}`);
+    await input.fill("").catch(() => {});
+    await input.fill(kw).catch(() => {});
+    await input.press("Enter").catch(() => {});
+    await sleep(2200);
+    const sug = page.locator("li, [class*=item], [class*=option], [class*=result]").filter({ hasText: />/ }).first();
+    if (await sug.isVisible().catch(() => false)) {
+      await sug.click().catch(() => {});
+      picked = true;
+      break;
+    }
+  }
+  if (picked) {
+    await sleep(800);
+    await clickText(page, /确认发布该类目|确定发布该类目|确认并下一步|确认类目|下一步|确定/);
+  }
+  const findForm = () => context.pages().find((p) => isFormUrl(p.url()));
+  const t0 = Date.now();
+  while (Date.now() - t0 < 12000) {
+    const f = findForm();
+    if (f) return f;
+    if (await page.getByText(/商品标题/).first().isVisible().catch(() => false)) return page;
+    await sleep(800);
+  }
+  await waitForHuman(page, async () => !!findForm() || (await page.getByText(/商品标题/).first().isVisible().catch(() => false)), "自动选类目没成功：请手动选好类目并进入“商品发布表单”页面", step);
+  return findForm() || page;
+}
+
+async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, mode, step }) {
+  let page = await context.newPage();
+  await step("打开拼多多商家后台发布页", { stage: "拼多多：打开发布页" });
+  await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+  const needLogin = async () => /login|passport/.test(page.url()) || (await page.getByText(/扫码登录|账号登录|手机登录/).first().isVisible().catch(() => false));
+  await sleep(2500);
+  if (await needLogin()) {
+    await waitForHuman(page, async () => !(await needLogin()), "拼多多商家后台需要登录", step);
+    await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+    await sleep(2000);
+  }
+  for (let i = 0; i < 3; i++) if (!(await clickText(page, /^(我知道了|知道了|以后再说|暂不|跳过)$/, 1500))) break;
+
+  await step("选择类目", { stage: "拼多多：选择类目" });
+  page = await pickCategory(page, context, pddTitle, cfg, step);
+  await page.bringToFront();
+  await sleep(2500);
+
+  const problems = [];
+  const attempt = async (name, fn) => {
+    try {
+      await fn();
+      await step(`✔ ${name}`);
+      return true;
+    } catch (e) {
+      problems.push(`${name}：${e.message.split("\n")[0]}`);
+      await step(`✘ ${name}：${e.message.split("\n")[0]}`);
+      return false;
+    }
+  };
+
+  await step("填写商品表单", { stage: "拼多多：填写表单" });
+  const okTitle = await attempt("商品标题", () => fillByLabel(page, /商品标题|商品名称/, pddTitle));
+  const gal = [...files.gallery];
+  for (const f of files.skuImages) if (gal.length < 3 && !gal.includes(f)) gal.push(f);
+  for (const f of files.detail) if (gal.length < 3 && !gal.includes(f)) gal.push(f);
+  const okImg = await attempt("商品轮播图", () => uploadByLabel(page, /商品轮播图|轮播图|商品主图/, gal.slice(0, 10), step));
+  await attempt("商品详情图", () => uploadByLabel(page, /商品详情图|图文详情|详情图/, (files.detail.length ? files.detail : files.gallery).slice(0, 20), step));
+  await attempt("商品规格", () => addSpecs(page, product, step));
+  let priced = 0;
+  await attempt("价格/库存表", async () => {
+    priced = await fillSkuTable(page, pricing);
+    if (!priced) throw new Error("没找到价格库存表（需要先建好规格），请手动填价格");
+  });
+  if (!priced && pricing.skus.length === 1) {
+    const s = pricing.skus[0];
+    const a = await fillByLabel(page, /拼单价/, s.group).then(() => true).catch(() => false);
+    await fillByLabel(page, /单买价/, s.single).catch(() => {});
+    await fillByLabel(page, /库存/, s.stock).catch(() => {});
+    if (a) priced = 1;
+  }
+  await attempt("参考价", () => fillByLabel(page, /参考价|市场价/, pricing.skus[0].market));
+  await attempt(`承诺发货 ${cfg.promiseHours} 小时`, async () => {
+    if (!(await clickText(page, new RegExp(`${cfg.promiseHours}\\s*小时`), 2000))) throw new Error("没找到选项");
+  });
+  if (cfg.shippingTemplate) {
+    await attempt("运费模板", async () => {
+      if (!(await tagNear(page, /运费模板/, "input, [class*=select]", true))) throw new Error("没找到运费模板选择框");
+      await page.locator('[data-agent-t="1"]').first().click();
+      await sleep(600);
+      if (!(await clickText(page, new RegExp(cfg.shippingTemplate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), 2000))) throw new Error("没找到该模板");
+    });
+  }
+
+  fs.mkdirSync(OUT, { recursive: true });
+  const shot = path.join(OUT, `${product.offerId}-filled.png`);
+  await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+  await step(`表单截图：${shot}`);
+
+  const complete = okTitle && okImg && priced > 0;
+  if (mode !== "publish" || !complete) {
+    const why = mode !== "publish" ? "填写模式：已停在提交前" : `自动填写不完整（${problems.join("；")}），未自动提交`;
+    await step(`✅ ${why}。请在浏览器里检查/补全，再点“提交”。`, {
+      status: "filled",
+      stage: "已填好，等你确认提交",
+      error: problems.length ? problems.join("\n") : "",
+    });
+    return { page, status: "filled" };
+  }
+
+  await step("点击提交上架", { stage: "拼多多：提交" });
+  const clicked = await clickText(page, /提交并上架|提交上架|立即发布|发布商品|提交审核|提交/, 5000);
+  if (!clicked) {
+    await step("没找到提交按钮，请手动点击", { status: "filled", stage: "已填好，没找到提交按钮", error: "没找到提交按钮" });
+    return { page, status: "filled" };
+  }
+  await sleep(2500);
+  await clickText(page, /^(确认提交|确定|继续提交|仍要提交)$/, 2000);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 25000) {
+    const okText = await page.getByText(/提交成功|发布成功|操作成功|创建成功/).first().isVisible().catch(() => false);
+    if (okText || /goods_list|goods\/list|success/.test(page.url())) {
+      const m = (page.url() + " " + (await page.locator("body").innerText().catch(() => ""))).match(/goods_?id[=:：]?\s*(\d{6,})|商品ID[：:]\s*(\d{6,})/i);
+      await step("🎉 拼多多提示提交成功", { status: "published", stage: "已提交上架", pddGoodsId: m ? m[1] || m[2] : "" });
+      return { page, status: "published" };
+    }
+    await sleep(1000);
+  }
+  const errs = await page.locator("text=/请输入|请选择|请上传|不能为空|必填|不符合/").allInnerTexts().catch(() => []);
+  const msg = errs.length ? uniq(errs).slice(0, 6).join("；") : "提交后未检测到成功提示";
+  await step(`⚠ 提交可能被拦截：${msg}。页面已保留，请手动处理。`, { status: "filled", stage: "提交被拦截，等你处理", error: msg });
+  return { page, status: "filled" };
+}
+
+// ───────────────────────── 任务流水线 ─────────────────────────
+async function runJob({ context, job, cfg, step, mode }) {
+  const offerId = job.offerId;
+  const outDir = path.join(OUT, offerId);
+  fs.mkdirSync(outDir, { recursive: true });
+  let page = await context.newPage();
+  let keepPage = null;
+  try {
+    // 提醒登录状态（不阻塞）
+    const ck = await context.cookies("https://www.1688.com").catch(() => []);
+    if (!ck.some((c) => c.name === "__cn_logon__" && c.value === "true"))
+      await step("⚠ 似乎还没登录 1688，价格/代发信息可能读不全。可先运行 node agent.mjs login");
+
+    const product = await extract1688(page, context, offerId, step);
+    await page.close().catch(() => {});
+    page = null;
+
+    const ev = evaluate(product, cfg);
+    const pddTitle = buildPddTitle(product.title);
+    for (const r of ev.reasons) await step(`${r.level === "block" ? "⛔" : r.level === "warn" ? "⚠" : "✔"} ${r.msg}`);
+    const summary = { ...product, text: undefined };
+    fs.writeFileSync(path.join(outDir, "product.json"), JSON.stringify({ product: summary, ...ev, pddTitle }, null, 2));
+
+    const base = { title: product.title, pddTitle, verdict: ev.verdict, reasons: ev.reasons, product: summary, pricing: ev.pricing };
+    if (!ev.canList) {
+      await step("判断结果：不建议上架", { ...base, status: "rejected", stage: "不能上架" });
+      return { status: "rejected", verdict: ev.verdict, reasons: ev.reasons, pricing: ev.pricing };
+    }
+    if (mode === "check") {
+      await step(`判断结果：可以上架（${ev.verdict === "ok" ? "无问题" : "有警告"}），建议拼单价 ¥${ev.pricing.maxGroup}`, { ...base, status: "eligible", stage: "可以上架" });
+      return { status: "eligible", verdict: ev.verdict, reasons: ev.reasons, pricing: ev.pricing };
+    }
+    await step("判断结果：可以上架，开始准备素材", { ...base, stage: "下载图片" });
+
+    const skuImgs = uniq(product.skus.map((s) => s.image).filter(Boolean));
+    const files = {
+      gallery: await downloadImages(product.gallery, path.join(outDir, "gallery"), "g", step),
+      skuImages: await downloadImages(skuImgs.slice(0, 6), path.join(outDir, "sku"), "s", step),
+      detail: await downloadImages(product.detailImages, path.join(outDir, "detail"), "d", step),
+    };
+    await step(`图片：主图 ${files.gallery.length}，详情图 ${files.detail.length}`);
+
+    const res = await publishToPdd({ context, product, pricing: ev.pricing, pddTitle, files, cfg, mode, step });
+    if (res.status === "filled") keepPage = res.page;
+    return { status: res.status, verdict: ev.verdict, reasons: ev.reasons, pricing: ev.pricing };
+  } catch (e) {
+    const p = page || context.pages().at(-1);
+    const shot = path.join(outDir, "error.png");
+    await p?.screenshot({ path: shot }).catch(() => {});
+    await step(`❌ 出错：${e.message}（截图 ${shot}）`, { status: "failed", stage: "出错", error: e.message });
+    return { status: "failed", error: e.message };
+  } finally {
+    if (page && !page.isClosed()) await page.close().catch(() => {});
+    void keepPage;
+  }
+}
+
+// ───────────────────────── 命令 ─────────────────────────
+function loadLocalConfig() {
+  let cfg = { ...DEFAULTS };
+  if (flags.config) cfg = { ...cfg, ...JSON.parse(fs.readFileSync(flags.config, "utf8")) };
+  return cfg;
+}
+
+function parseOfferId(s) {
+  const t = String(s || "").trim();
+  if (/^\d{8,15}$/.test(t)) return t;
+  const m = t.match(/offer\/(\d{8,15})/) || t.match(/[?&](?:offerId|offer_id|id|object_id)=(\d{8,15})/i) || t.match(/(\d{10,15})\.html/);
+  return m ? m[1] : null;
+}
+
+function printResult(r) {
+  console.log("\n════════ 结果 ════════");
+  console.log("状态：", r.status, r.verdict ? `(${r.verdict})` : "");
+  if (r.pricing) {
+    console.log("建议定价：");
+    for (const s of r.pricing.skus.slice(0, 12))
+      console.log(`  ${s.name.padEnd(14)} 成本¥${s.cost}  拼单价¥${s.group}  单买价¥${s.single}  利润¥${s.profit}  库存${s.stock}`);
+  }
+  console.log("═══════════════════\n");
+}
+
+async function main() {
+  if (cmd === "help" || flags.help) {
+    console.log(fs.readFileSync(new URL(import.meta.url), "utf8").split("*/")[0].replace(/^\/\*\*?\n?|^ \* ?/gm, ""));
+    return;
+  }
+
+  if (cmd === "login") {
+    const { context, close } = await openBrowser();
+    const p1 = await context.newPage();
+    await p1.goto("https://login.1688.com/member/signin.htm", { waitUntil: "domcontentloaded" }).catch(() => {});
+    const p2 = await context.newPage();
+    await p2.goto("https://mms.pinduoduo.com/login/", { waitUntil: "domcontentloaded" }).catch(() => {});
+    console.log("\n请在弹出的浏览器里：\n  1) 登录 1688（采购账号）\n  2) 登录 拼多多商家后台\n登录完成后回到这里按回车。\n");
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    await rl.question("都登录好了吗？按回车继续 ");
+    rl.close();
+    const ck = await context.cookies("https://www.1688.com");
+    console.log("1688 登录态：", ck.some((c) => c.name === "__cn_logon__" && c.value === "true") ? "✔ 已登录" : "⚠ 未检测到（可能 cookie 名变了，不一定有问题）");
+    await p2.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await sleep(2500);
+    console.log("拼多多登录态：", /login|passport/.test(p2.url()) ? "⚠ 仍在登录页" : "✔ 已登录");
+    await close();
+    return;
+  }
+
+  if (cmd === "inspect-pdd") {
+    const { context, close } = await openBrowser();
+    const page = await context.newPage();
+    await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    await rl.question("请在浏览器里选好类目，进入“商品发布表单”页面，然后按回车 ");
+    rl.close();
+    const target = context.pages().find((p) => isFormUrl(p.url())) || page;
+    const info = await target.evaluate(() => ({
+      url: location.href,
+      labels: [...document.querySelectorAll("label,[class*=label],[class*=Label]")].map((e) => (e.innerText || "").trim()).filter((t) => t && t.length < 30),
+      inputs: [...document.querySelectorAll("input,textarea,select")].map((e) => ({ tag: e.tagName, type: e.type, placeholder: e.placeholder, name: e.name, cls: e.className, visible: e.getClientRects().length > 0 })),
+      buttons: [...document.querySelectorAll("button,[role=button]")].map((e) => (e.innerText || "").trim()).filter(Boolean),
+      tables: [...document.querySelectorAll("table")].map((t) => [...t.querySelectorAll("thead th, thead td")].map((x) => x.innerText.trim())),
+    }));
+    fs.mkdirSync(OUT, { recursive: true });
+    fs.writeFileSync(path.join(OUT, "pdd-form.json"), JSON.stringify(info, null, 2));
+    await target.screenshot({ path: path.join(OUT, "pdd-form.png"), fullPage: true });
+    console.log(`已保存 ${path.join(OUT, "pdd-form.json")} 和 pdd-form.png`);
+    await close();
+    return;
+  }
+
+  if (cmd === "check" || cmd === "list") {
+    const id = parseOfferId(positional[0]);
+    if (!id) throw new Error("请提供 1688 商品链接或商品 ID，例如：node agent.mjs check https://detail.1688.com/offer/123456789012.html");
+    const mode = cmd === "check" ? "check" : flags.submit ? "publish" : "fill";
+    const { context, close } = await openBrowser();
+    const step = makeStep(null, null);
+    const r = await runJob({ context, job: { offerId: id }, cfg: loadLocalConfig(), step, mode });
+    printResult(r);
+    if (r.status === "filled") {
+      console.log("浏览器已保留在发布页，请检查后手动提交。完成后按 Ctrl+C 退出。");
+      await new Promise(() => {});
+    }
+    await close();
+    return;
+  }
+
+  if (cmd === "watch") {
+    const server = String(flags.server || "").replace(/\/$/, "");
+    if (!server || server === "true") throw new Error("请用 --server 指定网页控制台地址，例如：node agent.mjs watch --server https://xxx.example.com");
+    const { context } = await openBrowser();
+    let alive = true;
+    context.on("close", () => {
+      alive = false;
+      console.log("浏览器已关闭，agent 退出");
+      process.exit(0);
+    });
+    console.log(`✔ agent 已启动，正在等待网页控制台 ${server} 的任务…（Ctrl+C 退出）`);
+    while (alive) {
+      try {
+        const res = await fetch(`${server}/api/agent/claim`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ host: os.hostname(), version: VERSION }),
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const { job, config } = await res.json();
+        if (!job) {
+          await sleep(3500);
+          continue;
+        }
+        console.log(`\n▶ 领取任务 #${job.id}  offer ${job.offerId}  模式 ${job.mode}`);
+        const step = makeStep(server, job.id);
+        await runJob({ context, job, cfg: { ...DEFAULTS, ...config }, step, mode: job.mode });
+      } catch (e) {
+        console.error(`[${ts()}] 与控制台通信失败：${e.message}，5 秒后重试`);
+        await sleep(5000);
+      }
+    }
+    return;
+  }
+
+  throw new Error(`未知命令 ${cmd}，运行 node agent.mjs help 查看用法`);
+}
+
+main().then(
+  () => process.exit(0),
+  (e) => {
+    console.error("\n❌ " + (e?.message || e));
+    process.exit(1);
+  }
+);

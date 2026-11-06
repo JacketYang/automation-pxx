@@ -1,0 +1,13 @@
+{
+  "name": "pdd-lister-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "login": "node agent.mjs login",
+    "inspect": "node agent.mjs inspect-pdd"
+  },
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}
