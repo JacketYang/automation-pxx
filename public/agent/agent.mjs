@@ -668,8 +668,8 @@ async function uploadCategoryCover(page, imagePath, step) {
       const input = inputs.nth(i);
       const info = await input.evaluate((el) => {
         const button = el.closest("button");
-        const section = el.closest('section[class*="goodsCarousel"]') ||
-          el.closest('[class*="goodsCarousel_uploadImgEnter"]');
+        const section = el.closest('[class*="goodsCarousel_uploadImgEnter"]') ||
+          el.closest('section[class*="goodsCarousel"]');
         return {
           accept: el.getAttribute("accept") || "",
           multiple: el.multiple,
@@ -700,8 +700,8 @@ async function uploadCategoryCover(page, imagePath, step) {
     const { frame, input, index, info } = candidate;
     try {
       const before = await input.evaluate((el) => {
-        const section = el.closest('section[class*="goodsCarousel"]') ||
-          el.closest('[class*="goodsCarousel_uploadImgEnter"]');
+        const section = el.closest('[class*="goodsCarousel_uploadImgEnter"]') ||
+          el.closest('section[class*="goodsCarousel"]');
         return {
           sectionText: (section?.innerText || "").trim().replace(/\\s+/g, " "),
           sectionImages: section?.querySelectorAll("img").length || 0,
@@ -719,8 +719,8 @@ async function uploadCategoryCover(page, imagePath, step) {
       let verified = null;
       while (Date.now() < deadline) {
         verified = await input.evaluate((el, oldState) => {
-          const section = el.closest('section[class*="goodsCarousel"]') ||
-            el.closest('[class*="goodsCarousel_uploadImgEnter"]');
+          const section = el.closest('[class*="goodsCarousel_uploadImgEnter"]') ||
+            el.closest('section[class*="goodsCarousel"]');
           const sectionText = (section?.innerText || "").trim().replace(/\\s+/g, " ");
           const sectionImages = section?.querySelectorAll("img").length || 0;
           const bodyImages = document.querySelectorAll("img").length;
