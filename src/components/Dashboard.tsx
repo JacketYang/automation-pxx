@@ -26,6 +26,8 @@ export default function Dashboard() {
   const [busy,setBusy]=useState(false);
   const [minProfit,setMinProfit]=useState("3");
   const [targetRoi,setTargetRoi]=useState("2");
+  const [shippingTemplate,setShippingTemplate]=useState("");
+  const [templates,setTemplates]=useState<string[]>([]);
   const [settingsSaved,setSettingsSaved]=useState(false);
   const [savingSettings,setSavingSettings]=useState(false);
   const load=useCallback(async()=>{
@@ -43,12 +45,16 @@ export default function Dashboard() {
     if(!online) return;
     fetch(API+"/settings",{cache:"no-store"}).then(r=>r.json()).then(v=>{
       setMinProfit(String(v.minProfit ?? 3)); setTargetRoi(String(v.targetRoi ?? 2));
+      if(v.shippingTemplate!==undefined) setShippingTemplate(String(v.shippingTemplate||""));
+    }).catch(()=>{});
+    fetch(API+"/shipping-templates",{cache:"no-store"}).then(r=>r.json()).then(v=>{
+      if(Array.isArray(v.templates)) setTemplates(v.templates);
     }).catch(()=>{});
   },[online]);
   async function saveSettings(){
     setSavingSettings(true);setSettingsSaved(false);setError("");
     try {
-      const r=await fetch(API+"/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({minProfit:Number(minProfit),targetRoi:Number(targetRoi)})});
+      const r=await fetch(API+"/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({minProfit:Number(minProfit),targetRoi:Number(targetRoi),shippingTemplate})});
       const data=await r.json(); if(!r.ok) throw new Error(data.error||"保存失败");
       setMinProfit(String(data.minProfit));setTargetRoi(String(data.targetRoi));setSettingsSaved(true);
     } catch(e){setError(e instanceof Error?e.message:"设置保存失败");}
@@ -96,8 +102,15 @@ export default function Dashboard() {
         <div><h2 className="font-semibold">利润与投产比</h2><p className="mt-1 text-xs text-slate-500">这两项仍是硬门槛；修改后保存在本机。</p></div>
         <label className="text-sm">每单最低利润（元）<input type="number" min="0" max="10000" step="0.5" value={minProfit} onChange={e=>{setMinProfit(e.target.value);setSettingsSaved(false);}} className="mt-1 block w-32 rounded-lg border border-slate-300 p-2"/></label>
         <label className="text-sm">目标 ROI<input type="number" min="1.01" max="100" step="0.1" value={targetRoi} onChange={e=>{setTargetRoi(e.target.value);setSettingsSaved(false);}} className="mt-1 block w-32 rounded-lg border border-slate-300 p-2"/></label>
+        <label className="text-sm">运费模板
+          <select value={shippingTemplate} onChange={e=>{setShippingTemplate(e.target.value);setSettingsSaved(false);}} className="mt-1 block w-52 rounded-lg border border-slate-300 p-2 bg-white">
+            <option value="">（不指定，用店铺默认）</option>
+            {templates.map(t=><option key={t} value={t}>{t}</option>)}
+          </select>
+        </label>
         <button disabled={!online||savingSettings} onClick={saveSettings} className="rounded-lg bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-40">{savingSettings?"保存中…":"保存参数"}</button>
         {settingsSaved&&<span className="text-xs text-emerald-700">已保存到本机</span>}
+        {templates.length===0&&online&&<span className="text-xs text-slate-400">运费模板列表：登录拼多多后可读取</span>}
       </div>
     </section>
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">

@@ -636,85 +636,262 @@ async function uploadByLabel(page, labelRe, files, step) {
   await step(`  已上传 ${files.length} 张（${labelRe.source}）`);
 }
 
-async function fillSkuTable(page, pricing) {
-  const tables = page.locator("table");
-  const n = await tables.count();
-  for (let t = 0; t < n; t++) {
-    const table = tables.nth(t);
-    let heads = await table.locator("thead th, thead td").allInnerTexts().catch(() => []);
-    if (!heads.length) heads = await table.locator("tr").first().locator("th,td").allInnerTexts().catch(() => []);
-    const idx = (re) => heads.findIndex((h) => re.test(h.replace(/[*＊]/g, "").trim()));
-    const gi = idx(/拼单价|团购价/), si = idx(/单买价/), ki = idx(/库存/);
-    if (gi < 0 && ki < 0) continue;
-    let rows = table.locator("tbody tr");
-    if (!(await rows.count())) rows = table.locator("tr").filter({ has: page.locator("input") });
-    const rc = await rows.count();
-    let filled = 0;
-    for (let r = 0; r < rc; r++) {
-      const row = rows.nth(r);
-      const text = await row.innerText().catch(() => "");
-      if (/拼单价|团购价/.test(text) && /单买价/.test(text)) continue;
-      let sku = pricing.skus.length === 1
-        ? pricing.skus[0]
-        : pricing.skus.find((s) => s.attrs?.length && s.attrs.every((a) => text.includes(a)));
-      // 拼多多 SKU 行有时只显示“已启用”，不展示规格文本；仅当行数与源 SKU 数完全一致时按行序对应。
-      if (!sku && rc === pricing.skus.length) sku = pricing.skus[r];
-      if (!sku) continue;
-      const cells = row.locator("td");
-      const setCell = async (i, val) => {
-        if (i < 0) return;
-        const inp = cells.nth(i).locator('input:not([type=checkbox]):not([type=radio]):not([type=hidden])').first();
-        if (await inp.count() && await inp.isVisible().catch(() => false)) {
-          await inp.fill(String(val));
-          filled++;
-        }
-      };
-      await setCell(gi, sku.group);
-      await setCell(si, sku.single);
-      await setCell(ki, sku.stock);
+// 价格/库存表：拼多多把「表头」和「数据行」拆成两个 <table>，
+// 数据行首列是规格名、无 input；因此不能用单个 table 的 thead 找列。
+// 步骤：① 全局找含「拼单价」的表头定列索引 ② 给数据行打标记 ③ 逐行按列填。
+// specs：addSpecs 实际录入的规格数组（含 original 原始值），用于按行匹配定价。
+async function fillSkuTable(page, pricing, specs) {
+  const list = Array.isArray(pricing) ? pricing : (pricing?.skus || []);
+  if (!list.length) return 0;
+  const heads = await page.evaluate(() => {
+    const t = (e) => (e.innerText || e.textContent || "").trim();
+    for (const tb of document.querySelectorAll("table")) {
+      const h = [...tb.querySelectorAll("tr:first-child th, tr:first-child td")].map(t);
+      if (h.some((x) => /拼单价|团购价/.test(x))) return h;
     }
-    if (filled) return filled;
-  }
-  return 0;
-}
+    return [];
+  });
+  if (!heads.length) return 0;
+  const cStock = heads.findIndex((h) => /库存/.test(h));
+  const cGroup = heads.findIndex((h) => /拼单价|团购价/.test(h));
+  const cSingle = heads.findIndex((h) => /单买价/.test(h));
+  if (cGroup < 0 && cStock < 0) return 0;
 
-async function addSpecs(page, product, step) {
-  const dims = product.dims.slice(0, 2);
-  if (!dims.length || !product.skuRead) return;
-  const nameInputs = page.locator('input[placeholder*="规格类型"], input[placeholder*="规格名"], input[placeholder*="请选择规格"]');
-  const nameCount = await nameInputs.count();
-  const valueInputs = page.locator('input[placeholder*="规格值"], input[placeholder*="添加规格值"], input[placeholder*="输入规格"], input[placeholder="请输入规格名称"], input[placeholder="自定义款式"], input[placeholder="自定义组合"]');
-  let valueCursor = 0;
-  let added = 0;
-  for (let i = 0; i < dims.length; i++) {
-    const d = dims[i];
-    const ni = nameInputs.nth(i);
-    if (i < nameCount && await ni.isVisible().catch(() => false)) {
-      const current = await ni.getAttribute("value").catch(() => "");
-      if (!current || current.startsWith("规格类型")) {
-        await ni.fill(d.name.slice(0, 20));
-        await ni.press("Enter").catch(() => {});
+  // 标记数据行：首列是 TD、无 input、有规格名文本
+  await page.evaluate(() => {
+    document.querySelectorAll("[data-agent-skurow]").forEach((e) => e.removeAttribute("data-agent-skurow"));
+    for (const tb of document.querySelectorAll("table")) {
+      const rows = [...tb.querySelectorAll("tr")].filter((tr) => {
+        const c = [...tr.querySelectorAll("td,th")];
+        return c.length >= 3 && c[0].tagName === "TD" && c[0].querySelectorAll("input").length === 0 && (c[0].innerText || "").trim();
+      });
+      if (rows.length) { rows.forEach((tr) => tr.setAttribute("data-agent-skurow", "1")); break; }
+    }
+  });
+  const rows = page.locator('[data-agent-skurow="1"]');
+  const rc = await rows.count();
+  if (!rc) return 0;
+
+  let filled = 0;
+  for (let r = 0; r < rc; r++) {
+    const row = rows.nth(r);
+    const name = (await row.locator("td,th").first().innerText().catch(() => "")).trim();
+    // 优先按规格名匹配（去掉我加的去重数字后缀），再退化为行序
+    const cleanName = name.replace(/\d+$/, "");
+    let sku = specs?.[r] ? list.find((s) => s.name === specs[r].original) : null;
+    if (!sku) sku = list.find((s) => String(s.name).includes(cleanName) || (cleanName && String(s.name).replace(/\s/g, "").includes(cleanName.replace(/\s/g, ""))));
+    if (!sku && rc === list.length) sku = list[r];
+    if (!sku && list.length === 1) sku = list[0];
+    if (!sku) continue;
+    const cells = row.locator("td,th");
+    for (const [ci, val] of [[cStock, sku.stock], [cGroup, sku.group], [cSingle, sku.single]]) {
+      if (ci < 0) continue;
+      const inp = cells.nth(ci).locator('input:not([type=checkbox]):not([type=radio]):not([type=hidden])').first();
+      if (await inp.count() && await inp.isVisible().catch(() => false)) {
+        await inp.fill(String(val)).catch(() => {});
+        filled++;
       }
     }
-    // 兼容拼多多当前类目表单中的“自定义款式/自定义组合”规格值输入框。
-    let vi = valueInputs.nth(i);
-    if (!(await vi.isVisible().catch(() => false))) {
-      vi = valueInputs.nth(valueCursor);
-    }
-    if (!(await vi.isVisible().catch(() => false))) {
-      await step(`  ⚠ 规格「${d.name}」未找到可见规格值输入框，保留页面供人工检查`);
-      continue;
-    }
-    for (const v of d.values.slice(0, 30)) {
-      await vi.fill(String(v).slice(0, 20));
-      await vi.press("Enter").catch(() => {});
-      await sleep(250);
-      added++;
-    }
-    valueCursor++;
   }
-  await step(`  规格录入完成：${dims.map((d) => d.name).join(" / ")}；已提交 ${added} 个规格值`);
+  return filled;
+}
+
+// 给价格库存表每一行上传 SKU 预览图（*预览图 列，隐藏 file input）。
+// 拼多多强制要求每个规格有预览图，否则提交时报「请上传第 N 行规格的预览图」。
+// files 按规格行顺序；不足时循环复用，保证每行都有图。
+async function fillSkuPreviewImages(page, files, step) {
+  if (!files?.length) return 0;
+  // 复用 fillSkuTable 打的数据行标记；列索引从全局表头取「预览图」
+  const cImg = await page.evaluate(() => {
+    const t = (e) => (e.innerText || e.textContent || "").trim();
+    for (const tb of document.querySelectorAll("table")) {
+      const h = [...tb.querySelectorAll("tr:first-child th, tr:first-child td")].map(t);
+      const i = h.findIndex((x) => /预览图/.test(x));
+      if (i >= 0) return i;
+    }
+    return 4; // 真实页面固定第 5 列
+  });
+  await page.evaluate(() => {
+    document.querySelectorAll("[data-agent-skurow]").forEach((e) => e.removeAttribute("data-agent-skurow"));
+    for (const tb of document.querySelectorAll("table")) {
+      const rows = [...tb.querySelectorAll("tr")].filter((tr) => {
+        const c = [...tr.querySelectorAll("td,th")];
+        return c.length >= 3 && c[0].tagName === "TD" && c[0].querySelectorAll("input").length === 0 && (c[0].innerText || "").trim();
+      });
+      if (rows.length) { rows.forEach((tr) => tr.setAttribute("data-agent-skurow", "1")); break; }
+    }
+  });
+  const rows = page.locator('[data-agent-skurow="1"]');
+  const rc = await rows.count();
+  let uploaded = 0;
+  for (let r = 0; r < rc; r++) {
+    const file = files[r % files.length];
+    const fi = rows.nth(r).locator("td,th").nth(cImg).locator('input[type=file]').first();
+    if (await fi.count()) {
+      await fi.setInputFiles(file).catch(() => {});
+      uploaded++;
+      await sleep(300);
+    }
+  }
+  await sleep(1500);
+  await step(`  SKU 预览图：已为 ${uploaded}/${rc} 行上传`);
+  return uploaded;
+}
+
+// 拼多多单维度规格值上限（实测：颜色规格最多 16 个，再多页面不再新增 SKU 行）
+const PDD_SPEC_MAX = 16;
+
+// 把 1688 的规格值规范化成拼多多可填的短名：取【】内核心，去空格，截到 18 字，并去重
+function normalizeSpecValues(rawValues) {
+  const seen = new Set();
+  const out = [];
+  for (let i = 0; i < rawValues.length && out.length < PDD_SPEC_MAX; i++) {
+    const raw = String(rawValues[i] ?? "");
+    const m = raw.match(/【([^】]+)】/);
+    let s = (m ? m[1] : raw).replace(/\s+/g, "").slice(0, 18);
+    if (!s) continue;
+    // 去重：同名加短后缀，避免页面"规格值重复"错误
+    let base = s, n = 1;
+    while (seen.has(s) && n < 100) { s = base.slice(0, 15) + n; n++; }
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push({ label: s, original: raw });
+  }
+  return out;
+}
+
+// 拼多多颜色规格录入（真实页面控件：input[placeholder="选择或输入主色"] + 备注框回车）
+// 每录一个值，必须等到 SKU 行数确实增长再录下一个，否则页面来不及处理会丢失。
+async function addSpecs(page, product, step) {
+  if (!product.skuRead || !product.dims?.length) return [];
+  const specs = normalizeSpecValues(product.dims[0].values);
+  if (!specs.length) return [];
+
+  // 等规格输入框出现（详情页异步渲染）
+  let ready = false;
+  for (let i = 0; i < 25; i++) {
+    if (await page.locator('input[placeholder="选择或输入主色"]').count()) { ready = true; break; }
+    await sleep(400);
+  }
+  if (!ready) {
+    // 非颜色规格：回退到旧的通用规格值输入框
+    await step("  ⚠ 未发现颜色规格控件，尝试通用规格输入框");
+    return [];
+  }
+
+  const skuCount = () => page.evaluate(() => document.querySelectorAll("[class*=sku-row-spec]").length);
+  let added = 0;
+  for (const spec of specs) {
+    const before = await skuCount();
+    const mains = page.locator('input[placeholder="选择或输入主色"]');
+    const cnt = await mains.count();
+    let idx = -1;
+    for (let i = 0; i < cnt; i++) {
+      if (!(await mains.nth(i).inputValue().catch(() => "x"))) { idx = i; break; }
+    }
+    if (idx < 0) break;
+    await mains.nth(idx).fill(spec.label).catch(() => {});
+    await sleep(250);
+    const remarks = page.locator('input[placeholder="备注（偏深/浅等）"]');
+    const ri = Math.min(idx, (await remarks.count()) - 1);
+    if (ri >= 0) await remarks.nth(ri).press("Enter").catch(() => {});
+    // 等 SKU 行增长
+    let ok = false;
+    for (let w = 0; w < 14; w++) {
+      await sleep(250);
+      if ((await skuCount()) > before) { ok = true; break; }
+    }
+    if (ok) added++;
+    else {
+      await step(`  ⚠ 规格「${spec.label}」页面未生成 SKU 行（可能已达 ${PDD_SPEC_MAX} 个上限），停止录入`);
+      break;
+    }
+  }
+  await step(`  规格录入完成：${product.dims[0].name}；已生成 ${added} 个 SKU 行${specs.length > added ? `（源 ${specs.length} 个，取前 ${added} 个）` : ""}`);
+  await sleep(800);
+  // 返回实际生效的规格（供价格表按行序匹配 original）
+  return specs.slice(0, added);
+}
+
+// 商品属性：点击页面「一键复用」自动填入相似品属性（平台推荐，合规且最省事）。
+async function applyReuseAttrs(page, step) {
+  const btn = page.getByText("一键复用", { exact: true }).first();
+  if (!(await btn.isVisible().catch(() => false))) {
+    await step("  商品属性：无「一键复用」推荐，保留页面默认");
+    return false;
+  }
+  await btn.click().catch(() => {});
   await sleep(1000);
+  await step("  商品属性：已一键复用平台推荐属性");
+  return true;
+}
+
+// 服务与承诺：页面默认已勾选 48小时发货 / 7天无理由 / 非二手 等，
+// 这里只按配置选「承诺发货时间」，其余保持平台默认，不擅自改动。
+async function applyServiceDefaults(page, cfg, step) {
+  const hours = Number(cfg.promiseHours) || 48;
+  const label = `${hours}小时发货及揽收`;
+  const opt = page.getByText(new RegExp(`^${hours}\\s*小时发货`), { exact: false }).first();
+  if (await opt.isVisible().catch(() => false)) {
+    await opt.click().catch(() => {});
+    await step(`  服务与承诺：已选「${label}」`);
+  } else {
+    await step(`  服务与承诺：未找到「${label}」，保留页面默认 48 小时`);
+  }
+}
+
+// 应用运费模板：服务与承诺区默认折叠，先点「展开修改」，
+// 再选「其他模板」radio，最后在出现的模板列表里按名称选择。
+async function applyShippingTemplate(page, name, step) {
+  if (!name) return false;
+  // 1) 展开服务区
+  const expand = page.getByText("展开修改", { exact: true }).first();
+  if (await expand.count()) await expand.click({ force: true }).catch(() => {});
+  await sleep(600);
+  // 2) 点「其他模板」radio（用 label 点击，不依赖视口可见性）
+  const other = page.locator('label:has-text("其他模板")').first();
+  if (await other.count()) await other.click({ force: true }).catch(() => {});
+  await sleep(800);
+  // 3) 按名称选择模板：优先精确文本，其次包含
+  let target = page.getByText(name, { exact: true }).first();
+  if (!(await target.isVisible().catch(() => false))) {
+    target = page.getByText(name, { exact: false }).first();
+  }
+  if (await target.isVisible().catch(() => false)) {
+    await target.click({ force: true }).catch(() => {});
+    await step(`  运费模板：已选「${name}」`);
+    return true;
+  }
+  await step(`  ⚠ 运费模板「${name}」未在展开后的列表中找到，保留店铺默认模板（不影响提交）`);
+  return false;
+}
+
+// 拉取店铺当前运费模板列表：复用运费模板页（carriage/list）已打开的标签，
+// 没打开就临时开一个读取再关。返回名称数组。
+const CARRIAGE_URL = "https://mms.pinduoduo.com/orders/order/carriage/list";
+async function fetchShippingTemplates(context) {
+  let page = context.pages().find((p) => p.url().includes("carriage/list"));
+  let temp = false;
+  if (!page) { page = await context.newPage(); temp = true; }
+  try {
+    if (!page.url().includes("carriage/list")) {
+      await page.goto(CARRIAGE_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+      await sleep(2500);
+    }
+    const names = await page.evaluate(() => {
+      const out = [];
+      // 模板名出现在表格首列链接/单元格
+      for (const tr of document.querySelectorAll("tr")) {
+        const c = tr.querySelector("td");
+        if (!c) continue;
+        const t = (c.innerText || "").trim();
+        if (t && t.length < 40 && !/模板名称|计费方式|最后编辑/.test(t)) out.push(t.split("\n")[0].trim());
+      }
+      return [...new Set(out.filter(Boolean))];
+    });
+    return names;
+  } catch { return []; }
+  finally { if (temp) await page.close().catch(() => {}); }
 }
 
 async function pickCategory(page, context, pddTitle, cfg, step) {
@@ -1036,33 +1213,46 @@ async function isPddLoginRequired(page) {
 }
 
 // ── 登录态检测（供 /health 与前端展示）──
-// 复用常驻浏览器已打开的页面来判断，不额外弹窗口；结果缓存到 loginStatus。
+// 依据真实证据：常驻浏览器里存在"已登录的拼多多业务页"即判已登录。
+// 不再让一次缓存结果长期不刷新（旧逻辑：启动未登录 -> 后来登录后仍显示未登录）。
 let loginStatus = { pdd: "unknown", pdd1688: "unknown", checkedAt: 0 };
+const LOGIN_TTL = 1500; // ms；/health 轮询会自动刷新，登录后最多 1.5s 变绿
 
 async function refreshLoginStatus(context) {
   const result = { pdd: "unknown", pdd1688: "unknown", checkedAt: Date.now() };
   try {
-    // 1688：优先用 cookie 判断，不依赖页面
     const ck = await context.cookies("https://www.1688.com").catch(() => []);
     result.pdd1688 = ck.some((c) => c.name === "__cn_logon__" && c.value === "true") ? "logged_in" : "unknown";
   } catch {}
   try {
-    // 拼多多：复用已打开的 mms 页面；没有就临时开一个再关（不引入额外窗口）
-    let page = context.pages().find((p) => /mms\.pinduoduo\.com/.test(p.url()));
-    let temp = false;
-    if (!page) { page = await context.newPage(); temp = true; }
-    try {
-      if (!/mms\.pinduoduo\.com/.test(page.url())) {
+    const bizPages = context.pages().filter((p) => {
+      try { const u = new URL(p.url()); return u.hostname === "mms.pinduoduo.com" && !/(^|\/)(login|passport)/.test(u.pathname); }
+      catch { return false; }
+    });
+    let proven = false;
+    for (const p of bizPages) {
+      const body = await p.locator("body").innerText({ timeout: 1500 }).catch(() => "");
+      if (/退出当前账号|登录其他账号需先退出/.test(body) || /提交并上架|运费模板|商品列表|发布新商品/.test(body)) {
+        proven = true; break;
+      }
+    }
+    if (proven) result.pdd = "logged_in";
+    else {
+      const page = await context.newPage();
+      try {
         await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
         await sleep(1200);
-      }
-      result.pdd = (await isPddLoginRequired(page)) ? "need_login" : "logged_in";
-    } finally {
-      if (temp) await page.close().catch(() => {});
+        result.pdd = (await isPddLoginRequired(page)) ? "need_login" : "logged_in";
+      } finally { await page.close().catch(() => {}); }
     }
   } catch { result.pdd = "unknown"; }
   loginStatus = result;
   return result;
+}
+
+async function getLoginStatus(context) {
+  if (context && Date.now() - loginStatus.checkedAt > LOGIN_TTL) await refreshLoginStatus(context);
+  return loginStatus;
 }
 
 async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, mode, step }) {
@@ -1112,12 +1302,18 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   for (const f of files.detail) if (gal.length < 3 && !gal.includes(f)) gal.push(f);
   const okImg = await attempt("商品轮播图", () => uploadByLabel(page, /商品轮播图|轮播图|商品主图/, gal.slice(0, 10), step));
   await attempt("商品详情图", () => uploadByLabel(page, /商品详情|商品详情图|图文详情|详情图/, (files.detail.length ? files.detail : files.gallery).slice(0, 20), step));
-  await attempt("商品规格", () => addSpecs(page, product, step));
+  // 商品属性（平台推荐一键复用）
+  await attempt("商品属性", () => applyReuseAttrs(page, step));
+  // 规格录入（颜色控件），返回实际生效的规格供价格表匹配
+  let specs = [];
+  await attempt("商品规格", async () => { specs = await addSpecs(page, product, step); });
   let priced = 0;
   await attempt("价格/库存表", async () => {
-    priced = await fillSkuTable(page, pricing);
-    if (!priced) throw new Error("没找到价格库存表（需要先建好规格），请手动填价格");
+    priced = await fillSkuTable(page, pricing, specs);
+    if (!priced) throw new Error("价格库存表没有可填的数据行（规格可能未录入成功）");
   });
+  // SKU 预览图：拼多多强制每行都要有，否则提交被拦
+  await attempt("SKU 预览图", () => fillSkuPreviewImages(page, files.skuImages, step));
   if (!priced && pricing.skus.length === 1) {
     const s = pricing.skus[0];
     const a = await fillByLabel(page, /拼单价/, s.group).then(() => true).catch(() => false);
@@ -1125,17 +1321,11 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
     await fillByLabel(page, /库存/, s.stock).catch(() => {});
     if (a) priced = 1;
   }
-  // 不自动填写虚构的“市场参考价”；仅填核算出的拼单价和单买价。
-  await attempt(`承诺发货 ${cfg.promiseHours} 小时`, async () => {
-    if (!(await clickText(page, new RegExp(`${cfg.promiseHours}\\s*小时`), 2000))) throw new Error("没找到选项");
-  });
+  // 服务与承诺：按配置选发货时效，其余保持平台默认
+  await attempt(`承诺发货 ${cfg.promiseHours} 小时`, () => applyServiceDefaults(page, cfg, step));
+  // 运费模板：cfg.shippingTemplate 由工作台下拉选择后写入本机配置
   if (cfg.shippingTemplate) {
-    await attempt("运费模板", async () => {
-      if (!(await tagNear(page, /运费模板/, "input, [class*=select]", true))) throw new Error("没找到运费模板选择框");
-      await page.locator('[data-agent-t="1"]').first().click();
-      await sleep(600);
-      if (!(await clickText(page, new RegExp(cfg.shippingTemplate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), 2000))) throw new Error("没找到该模板");
-    });
+    await attempt("运费模板", () => applyShippingTemplate(page, cfg.shippingTemplate, step));
   }
 
   fs.mkdirSync(OUT, { recursive: true });
@@ -1212,13 +1402,15 @@ async function runJob({ context, job, cfg, step, mode }) {
     }
     await step("判断结果：可以上架，开始准备素材", { ...base, stage: "下载图片" });
 
-    const skuImgs = uniq(product.skus.map((s) => s.image).filter(Boolean));
+    // SKU 预览图：按规格值顺序取对应图，保证与价格表行一一对应；最多 16 张（拼多多规格上限）
+    const dimValues = (product.dims?.[0]?.values || []).slice(0, PDD_SPEC_MAX);
+    const skuImgs = dimValues.map((v) => product.skus.find((s) => s.name === v)?.image).filter(Boolean);
     const files = {
       gallery: await downloadImages(product.gallery, path.join(outDir, "gallery"), "g", step),
-      skuImages: await downloadImages(skuImgs.slice(0, 6), path.join(outDir, "sku"), "s", step),
+      skuImages: await downloadImages(skuImgs.slice(0, PDD_SPEC_MAX), path.join(outDir, "sku"), "s", step),
       detail: await downloadImages(product.detailImages, path.join(outDir, "detail"), "d", step),
     };
-    await step(`图片：主图 ${files.gallery.length}，详情图 ${files.detail.length}`);
+    await step(`图片：主图 ${files.gallery.length}，详情图 ${files.detail.length}，SKU 图 ${files.skuImages.length}`);
 
     const res = await publishToPdd({ context, product, pricing: ev.pricing, pddTitle, files, cfg, mode, step });
     if (res.status === "filled") keepPage = res.page;
@@ -1323,7 +1515,8 @@ async function main() {
       if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       if (req.method === "GET" && req.url === "/health") {
-        res.writeHead(200); res.end(JSON.stringify({ online: true, version: "1.1.0", host: process.env.COMPUTERNAME || "本机", active, port: PORT, login: loginStatus })); return;
+        const login = await getLoginStatus(context);
+        res.writeHead(200); res.end(JSON.stringify({ online: true, version: "1.1.0", host: process.env.COMPUTERNAME || "本机", active, port: PORT, login })); return;
       }
       // 主动刷新登录检测（前端「重新检测」按钮）
       if (req.method === "POST" && req.url === "/check-login") {
@@ -1346,9 +1539,14 @@ async function main() {
       if (req.method === "GET" && req.url === "/jobs") {
         res.writeHead(200); res.end(JSON.stringify({ jobs: jobs.slice().reverse() })); return;
       }
+      // 运费模板列表（读取店铺 carriage/list 页）
+      if (req.method === "GET" && req.url === "/shipping-templates") {
+        const templates = context ? await fetchShippingTemplates(context) : [];
+        res.writeHead(200); res.end(JSON.stringify({ templates })); return;
+      }
       if (req.method === "GET" && req.url === "/settings") {
         const cfg = loadLocalConfig();
-        res.writeHead(200); res.end(JSON.stringify({ minProfit: cfg.minProfit, targetRoi: cfg.targetRoi, shippingCost: cfg.shippingCost })); return;
+        res.writeHead(200); res.end(JSON.stringify({ minProfit: cfg.minProfit, targetRoi: cfg.targetRoi, shippingCost: cfg.shippingCost, promiseHours: cfg.promiseHours, shippingTemplate: cfg.shippingTemplate })); return;
       }
       if (req.method === "POST" && req.url === "/settings") {
         let raw = "";
@@ -1363,8 +1561,13 @@ async function main() {
         }
         const current = loadLocalConfig();
         const next = { ...current, minProfit: round2(minProfit), targetRoi: round2(targetRoi) };
+        if (typeof body.shippingTemplate === "string") next.shippingTemplate = body.shippingTemplate.trim();
+        if (body.promiseHours !== undefined) {
+          const h = Number(body.promiseHours);
+          if ([24, 48].includes(h)) next.promiseHours = h;
+        }
         fs.writeFileSync(LOCAL_CONFIG_PATH, JSON.stringify(next, null, 2), "utf8");
-        res.writeHead(200); res.end(JSON.stringify({ minProfit: next.minProfit, targetRoi: next.targetRoi })); return;
+        res.writeHead(200); res.end(JSON.stringify({ minProfit: next.minProfit, targetRoi: next.targetRoi, shippingTemplate: next.shippingTemplate, promiseHours: next.promiseHours })); return;
       }
       if (req.method === "POST" && req.url === "/jobs") {
         let raw = "";
