@@ -854,7 +854,7 @@ async function main() {
       if (!origin) return true;
       try {
         const u = new URL(origin);
-        return u.protocol === "https:" || u.hostname === "localhost" || u.hostname === "127.0.0.1";
+        return (u.protocol === "https:" && u.hostname.endsWith(".vercel.app")) || u.hostname === "localhost" || u.hostname === "127.0.0.1";
       } catch { return false; }
     };
     const server = createServer(async (req, res) => {
@@ -865,6 +865,7 @@ async function main() {
         res.setHeader("Vary", "Origin");
         res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        res.setHeader("Access-Control-Allow-Private-Network", "true");
       }
       if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
       res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -918,6 +919,7 @@ async function main() {
       }
     });
     server.on("error", e => { console.error("本机服务启动失败：", e.message); process.exitCode = 1; });
+    await new Promise(() => {});
     return;
   }
 
