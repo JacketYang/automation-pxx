@@ -19,6 +19,8 @@ export default function Dashboard() {
   const [mode,setMode]=useState<"check"|"fill"|"publish">("fill");
   const [online,setOnline]=useState(false);
   const [host,setHost]=useState("");
+  const [login,setLogin]=useState<{pdd:string;pdd1688:string;checkedAt:number}>({pdd:"unknown",pdd1688:"unknown",checkedAt:0});
+  const [loginBusy,setLoginBusy]=useState(false);
   const [jobs,setJobs]=useState<Job[]>([]);
   const [error,setError]=useState("");
   const [busy,setBusy]=useState(false);
@@ -31,7 +33,9 @@ export default function Dashboard() {
       const [h,j]=await Promise.all([fetch(API+"/health",{cache:"no-store"}),fetch(API+"/jobs",{cache:"no-store"})]);
       if(!h.ok||!j.ok) throw new Error("Agent 未响应");
       const health=await h.json(); const data=await j.json();
-      setOnline(Boolean(health.online)); setHost(health.host||"本机"); setJobs(data.jobs||[]); setError("");
+      setOnline(Boolean(health.online)); setHost(health.host||"本机"); setJobs(data.jobs||[]);
+      if(health.login) setLogin(health.login);
+      setError("");
     } catch { setOnline(false); setHost(""); }
   },[]);
   useEffect(()=>{ load(); const t=window.setInterval(load,1500); return ()=>window.clearInterval(t); },[load]);
@@ -50,6 +54,18 @@ export default function Dashboard() {
     } catch(e){setError(e instanceof Error?e.message:"设置保存失败");}
     finally{setSavingSettings(false);}
   }
+  async function openLogin(){
+    setLoginBusy(true);setError("");
+    try { const r=await fetch(API+"/login",{method:"POST"}); const d=await r.json(); if(!r.ok) throw new Error(d.error||"打开登录页失败"); }
+    catch(e){setError(e instanceof Error?e.message:"打开登录页失败");}
+    finally{setLoginBusy(false);}
+  }
+  async function recheckLogin(){
+    setLoginBusy(true);setError("");
+    try { const r=await fetch(API+"/check-login",{method:"POST"}); const d=await r.json(); if(!r.ok) throw new Error(d.error||"检测失败"); if(d.login) setLogin(d.login); }
+    catch(e){setError(e instanceof Error?e.message:"检测失败");}
+    finally{setLoginBusy(false);}
+  }
   async function submit(){
     setBusy(true);setError("");
     try {
@@ -63,8 +79,17 @@ export default function Dashboard() {
   return <main className="mx-auto max-w-5xl px-4 py-8">
     <header className="mb-6 flex flex-wrap items-center gap-3">
       <div><div className="text-sm font-medium text-blue-700">PXX · 第一阶段 · 本地部署</div><h1 className="text-2xl font-bold">1688 商品分析 → 拼多多上架</h1><p className="mt-1 text-sm text-slate-500">网页与本机 Agent 都运行在你自己的电脑上，浏览器登录态一直保留，不会重复登录。</p></div>
-      <div className={`ml-auto rounded-full px-4 py-2 text-sm font-medium ${online?"bg-emerald-100 text-emerald-800":"bg-red-100 text-red-700"}`}>{online?"● Agent 在线 · "+host:"● Agent 未连接"}</div>
+      <div className="ml-auto flex items-center gap-2">
+        {online&&<span className={`rounded-full px-3 py-1 text-xs font-medium ${login.pdd==="logged_in"?"bg-emerald-100 text-emerald-800":login.pdd==="need_login"?"bg-amber-100 text-amber-800":"bg-slate-100 text-slate-600"}`}>
+          {login.pdd==="logged_in"?"拼多多已登录":login.pdd==="need_login"?"拼多多未登录":"登录态未检测"}
+        </span>}
+        {online&&<button disabled={loginBusy} onClick={login.pdd==="logged_in"?recheckLogin:openLogin} className="rounded-lg border border-slate-300 px-3 py-1 text-xs text-slate-700 disabled:opacity-40">
+          {loginBusy?"处理中…":login.pdd==="logged_in"?"重新检测":"去登录"}
+        </button>}
+        <div className={`rounded-full px-4 py-2 text-sm font-medium ${online?"bg-emerald-100 text-emerald-800":"bg-red-100 text-red-700"}`}>{online?"● Agent 在线 · "+host:"● Agent 未连接"}</div>
+      </div>
     </header>
+    {online&&login.pdd==="need_login"&&<div className="mb-5 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">拼多多商家后台尚未登录。点右上角「去登录」会在常驻浏览器打开登录页，登录完成后点「重新检测」或提交任务即会自动检测，无需重启。</div>}
     {!online&&<div className="mb-5 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">请先双击 <b>start-agent.bat</b> 启动本机 Agent（会同时拉起常驻浏览器）。首次使用先双击 <b>login-agent.bat</b> 登录 1688 和拼多多，之后浏览器保持打开，无需再登录。</div>}
     <section className="mb-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
       <div className="flex flex-wrap items-end gap-4">

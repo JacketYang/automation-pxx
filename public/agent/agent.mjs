@@ -1035,6 +1035,36 @@ async function isPddLoginRequired(page) {
   return false;
 }
 
+// ── 登录态检测（供 /health 与前端展示）──
+// 复用常驻浏览器已打开的页面来判断，不额外弹窗口；结果缓存到 loginStatus。
+let loginStatus = { pdd: "unknown", pdd1688: "unknown", checkedAt: 0 };
+
+async function refreshLoginStatus(context) {
+  const result = { pdd: "unknown", pdd1688: "unknown", checkedAt: Date.now() };
+  try {
+    // 1688：优先用 cookie 判断，不依赖页面
+    const ck = await context.cookies("https://www.1688.com").catch(() => []);
+    result.pdd1688 = ck.some((c) => c.name === "__cn_logon__" && c.value === "true") ? "logged_in" : "unknown";
+  } catch {}
+  try {
+    // 拼多多：复用已打开的 mms 页面；没有就临时开一个再关（不引入额外窗口）
+    let page = context.pages().find((p) => /mms\.pinduoduo\.com/.test(p.url()));
+    let temp = false;
+    if (!page) { page = await context.newPage(); temp = true; }
+    try {
+      if (!/mms\.pinduoduo\.com/.test(page.url())) {
+        await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+        await sleep(1200);
+      }
+      result.pdd = (await isPddLoginRequired(page)) ? "need_login" : "logged_in";
+    } finally {
+      if (temp) await page.close().catch(() => {});
+    }
+  } catch { result.pdd = "unknown"; }
+  loginStatus = result;
+  return result;
+}
+
 async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, mode, step }) {
   let page = await context.newPage();
   await step("打开拼多多商家后台发布页", { stage: "拼多多：打开发布页" });
@@ -1293,7 +1323,25 @@ async function main() {
       if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       if (req.method === "GET" && req.url === "/health") {
-        res.writeHead(200); res.end(JSON.stringify({ online: true, version: "1.1.0", host: process.env.COMPUTERNAME || "本机", active, port: PORT })); return;
+        res.writeHead(200); res.end(JSON.stringify({ online: true, version: "1.1.0", host: process.env.COMPUTERNAME || "本机", active, port: PORT, login: loginStatus })); return;
+      }
+      // 主动刷新登录检测（前端「重新检测」按钮）
+      if (req.method === "POST" && req.url === "/check-login") {
+        const s = context ? await refreshLoginStatus(context) : loginStatus;
+        res.writeHead(200); res.end(JSON.stringify({ login: s })); return;
+      }
+      // 在常驻浏览器里打开两个登录页（复用同一窗口的新标签，不新开浏览器）
+      if (req.method === "POST" && req.url === "/login") {
+        try {
+          const { context: c } = await openBrowser();
+          const p1 = await c.newPage();
+          await p1.goto("https://login.1688.com/member/signin.htm", { waitUntil: "domcontentloaded" }).catch(() => {});
+          const p2 = await c.newPage();
+          await p2.goto("https://mms.pinduoduo.com/login/", { waitUntil: "domcontentloaded" }).catch(() => {});
+          res.writeHead(200); res.end(JSON.stringify({ ok: true, msg: "已在常驻浏览器打开 1688 / 拼多多登录页" })); return;
+        } catch (e) {
+          res.writeHead(500); res.end(JSON.stringify({ error: e.message })); return;
+        }
       }
       if (req.method === "GET" && req.url === "/jobs") {
         res.writeHead(200); res.end(JSON.stringify({ jobs: jobs.slice().reverse() })); return;
@@ -1342,17 +1390,9 @@ async function main() {
         const opened = await openBrowser();
         context = opened.context;
         console.log(`✔ 常驻浏览器已就绪（调试端口 ${CDP_PORT}，登录态会一直保留，请勿关闭该 Chrome 窗口）`);
-        // 启动即检查拼多多是否已登录；未登录就地在常驻浏览器打开登录页，等人操作。
-        const probe = await context.newPage();
-        await probe.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-        await sleep(2000);
-        if (await isPddLoginRequired(probe)) {
-          console.log("\n⚠ 拼多多尚未登录。请在已打开的浏览器里完成登录（或另开一个终端运行：node agent.mjs login）。");
-          console.log("  登录完成后本服务会自动检测到，无需重启。\n");
-        } else {
-          console.log("✔ 拼多多登录态有效，可直接开始处理任务。");
-        }
-        await probe.close().catch(() => {});
+        const s0 = await refreshLoginStatus(context);
+        console.log(s0.pdd === "logged_in" ? "✔ 拼多多登录态有效，可直接开始处理任务。" :
+          "⚠ 拼多多尚未登录，请在浏览器完成登录（或点网页右上角「去登录」）。登录后点「重新检测」，任务执行前也会自动检测。");
         while (true) {
           const job = jobs.find(x => x.status === "queued");
           if (!job) { await sleep(700); continue; }
@@ -1360,7 +1400,9 @@ async function main() {
           job.status = "running";
           job.stage = "开始处理";
           const step = makeStep(job);
+          await refreshLoginStatus(context).catch(() => {});
           await runJob({ context, job, cfg: loadLocalConfig(), step, mode: job.mode });
+          await refreshLoginStatus(context).catch(() => {});
           if (job.status === "running") { job.status = "failed"; job.stage = "任务结束但未返回结果"; }
           job.updatedAt = new Date().toISOString();
           active = false;
