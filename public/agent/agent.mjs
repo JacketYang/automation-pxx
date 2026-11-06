@@ -296,7 +296,10 @@ async function extract1688(page, context, offerId, step) {
   const onePiecePriceMatch = dropshipSection.match(/(?:1件价格|一件价格)[\s\S]{0,24}?[¥￥]\s*([\d.]+)/);
   const onePiecePrice = onePiecePriceMatch ? Number(onePiecePriceMatch[1]) : null;
   const shipMatch = dropshipSection.match(/(?:运费|快递费)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*(?:元)?(?:起)?/);
-  const freeShip = /(?:1件|一件)[^\n]{0,20}包邮|包邮/.test(dropshipSection);
+  const singlePieceFreeShip = /(?:1件|一件)[^\n]{0,20}包邮|包邮[^\n]{0,20}(?:1件|一件)/.test(dropshipSection);
+  const multiPieceOnlyFreeShip = /(?:满?\\s*2件包邮|2件起包邮|≥\\s*2件包邮|两件包邮)/.test(dropshipSection);
+  const genericSinglePriceFreeShip = /包邮/.test(dropshipSection) && /(?:1件价格|一件价格)/.test(dropshipSection) && !multiPieceOnlyFreeShip;
+  const freeShip = singlePieceFreeShip || genericSinglePriceFreeShip;
   const onePieceDropship = /一件代发|1件代发|1件价格|一件价格|1件包邮|一件包邮|1件起发|一件起发/i.test(dropshipSection);
 
   // 规格
