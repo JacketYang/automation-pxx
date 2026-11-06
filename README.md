@@ -1,53 +1,67 @@
-# 1688 → 拼多多自动上架工作台
+# PXX：1688 商品分析 → 拼多多上架
 
-工作台部署在 Vercel；Playwright Agent 运行在你自己的 Windows 电脑上。Chrome 登录态和 profile 只保存在本机。
+当前只开发第一阶段：读取 1688 商品、分析 SKU 成本和利润、判断上架条件，并在用户自己的 Windows 浏览器中填写拼多多商品表单。
 
-## 1. 创建 Neon 数据库
-1. 在 https://neon.tech 创建 PostgreSQL 项目，区域尽量选靠近 Vercel 部署区域的地点。
-2. 复制 Pooled connection string（主机名包含 `-pooler`）作为运行时连接；再复制 Direct connection string（主机名不含 `-pooler`）用于数据库迁移。两者都保留 `sslmode=require`。
-3. 分别保存为 Vercel 环境变量 `DATABASE_URL` 和 `DATABASE_URL_UNPOOLED`。
+## 一键部署
 
-## 2. 设置 Vercel 环境变量
-在本地 PowerShell 运行两次以下命令，分别生成 AUTH_SECRET 和 AGENT_TOKEN（两次结果必须不同）：
+1. 将本仓库导入 Vercel。
+2. Framework 选择 Next.js，Root Directory 使用仓库根目录。
+3. 不需要配置 Environment Variables。
+4. 后续推送到 `main`，Vercel 自动重新部署。
+
+当前 MVP 目标是不依赖 PostgreSQL、Neon、Supabase、Redis、AUTH_SECRET、AGENT_TOKEN 或 DASHBOARD_PASSWORD。网页不承担云端任务队列；商品浏览器操作由用户本机 Agent 执行。
+
+## 本机 Agent（Windows）
+
+需要 Node.js 18+ 和 Chrome 或 Edge。下载 `public/agent` 目录中的四个文件到同一目录：
+
+- `agent.mjs`
+- `package.json`
+- `pricing.mjs`
+- `pricing.test.mjs`
+
+PowerShell：
+
 ```powershell
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-在 Vercel → Project → Settings → Environment Variables 设置：
-- `DATABASE_URL`：Neon pooled connection string（Vercel Functions 运行时）
-- `DATABASE_URL_UNPOOLED`：Neon direct connection string（运行 Drizzle 迁移时使用；可选）
-- `DASHBOARD_PASSWORD`：你自己设置的长随机工作台密码
-- `AUTH_SECRET`：第一条命令生成的随机值（至少 32 字符）
-- `AGENT_TOKEN`：第二条命令生成的另一个随机值
-
-不要把任何真实密钥提交到 GitHub。
-
-## 3. 部署
-在 Vercel 中 Add New → Project → Import Git Repository，选择 `JacketYang/automation-pxx`。
-部署分支先选 `deploy/vercel-neon-hardening` 进行验证；Framework Preset 选 Next.js，Root Directory 保持仓库根目录。确认四个必需环境变量和可选的 DATABASE_URL_UNPOOLED 已添加后 Deploy。
-
-## 4. 初始化数据库
-在 Neon 控制台 SQL Editor 中执行仓库文件 `database/schema.sql`。也可以在本地设置好 DATABASE_URL_UNPOOLED 后运行 `npm install`、`npm run db:push`。Drizzle 迁移优先使用直连，Vercel 运行时继续使用 pooled DATABASE_URL。
-
-## 5. Windows 本机 Agent
-在新目录下载 agent（不要覆盖旧的 profile）：
-```powershell
-mkdir pdd-agent-cloud
-cd pdd-agent-cloud
-Invoke-WebRequest https://YOUR-VERCEL-DOMAIN/agent/agent.mjs -OutFile agent.mjs
-Invoke-WebRequest https://YOUR-VERCEL-DOMAIN/agent/package.json -OutFile package.json
-Invoke-WebRequest https://YOUR-VERCEL-DOMAIN/agent/pricing.mjs -OutFile pricing.mjs
-Invoke-WebRequest https://YOUR-VERCEL-DOMAIN/agent/pricing.test.mjs -OutFile pricing.test.mjs
 npm install
+npm test
 node agent.mjs login
-$env:PDD_AGENT_TOKEN = "填入与 Vercel AGENT_TOKEN 相同的值"
-node agent.mjs watch --server https://YOUR-VERCEL-DOMAIN --token $env:PDD_AGENT_TOKEN
 ```
-把 YOUR-VERCEL-DOMAIN 换成真实 Vercel 域名。登录弹出的独立浏览器，分别登录 1688 和拼多多商家后台。Agent 需要保持运行。
 
-## 6. 验证流程
-先选择「只判断」测试普通商品；再选择「判断 + 填好表单」检查类目、SKU、图片和价格。初期建议不要启用自动提交，人工核对后再决定。
+在弹出的独立浏览器里登录 1688 和拼多多商家后台。然后执行：
 
-## 安全说明
-- 不要把账号密码、验证码、Cookie、Chrome Profile、Neon 连接串或 Token 发给任何人。
-- Vercel 负责网页/API；它不会运行持久 Chrome 或 Android 模拟器。Agent 必须在本机运行。
-- 商品风险判断是辅助规则，不等同平台审核或法律意见。品牌、资质、食品、电器等风险项应人工复核。
+```powershell
+node agent.mjs check "https://detail.1688.com/offer/123456789012.html"
+node agent.mjs list "https://detail.1688.com/offer/123456789012.html"
+```
+
+- `check`：只分析商品。
+- `list`：分析并填写拼多多表单，停在提交前。
+- `list --submit`：提交上架。前期先不要批量自动提交。
+
+登录态和 `chrome-profile` 目录只保存在本机，严禁提交到 GitHub 或上传到云端。
+
+## 定价规则
+
+逐 SKU 计算贡献利润，参考 `JacketYang/xiaoman`：
+
+`P × (1 - 平台费率 - 售后损耗率 - 1/目标 ROI) - 商品成本 - 单件运费 - 其他单笔成本 ≥ 目标经营利润`
+
+默认参数：平台费率 0.6%、售后损耗 3%、目标 ROI 2、目标经营利润 ¥3。最低加价率只作为售价下限。缺少明确一件代发价或单件运费/包邮证据时，不允许自动上架。经营参数需要根据店铺真实账单和投放数据校准。
+
+## 当前不做
+
+- 云端数据库、云端任务队列和多设备同步
+- 登录系统、权限系统、Token 和密码环境变量
+- 订单采购、发货、推广、客服和售后
+- 自动绕过验证码或平台风控
+
+## 验证
+
+```bash
+npm test
+npm run typecheck
+npm run build
+```
+
+先保证网页可一键部署和本机 Agent 可运行，再迭代真实商品页面兼容性。平台页面可能改版或触发验证；遇到登录、验证码、类目或商品属性不确定时暂停，由用户处理。
