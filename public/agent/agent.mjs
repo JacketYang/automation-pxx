@@ -652,6 +652,51 @@ async function pickCategory(page, context, pddTitle, cfg, step) {
   return findForm() || page;
 }
 
+async function armPddToastCapture(page) {
+  for ( (const frame of page.frames()) ) {
+    await frame.evaluate(() => {
+      window.__pxxToastMessages = [];
+      const selectors = '[class*="toast"],[class*="Toast"],[class*="message"],[class*="Message"],[class*="notice"],[role="alert"],[aria-live]';
+      const collect = (root) => {
+        const nodes = [];
+        if (root instanceof Element && root.matches(selectors)) nodes.push(root);
+        if (root.querySelectorAll) nodes.push(...root.querySelectorAll(selectors));
+        for (const el of nodes) {
+          if (!el.getClientRects().length) continue;
+          const text = (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 300);
+          if (text && !window.__pxxToastMessages.includes(text)) {
+            window.__pxxToastMessages.push(text);
+            if (window.__pxxToastMessages.length > 20) window.__pxxToastMessages.shift();
+          }
+        }
+      };
+      collect(document);
+      if (window.__pxxToastObserver) window.__pxxToastObserver.disconnect();
+      window.__pxxToastObserver = new MutationObserver((records) => {
+        for (const record of records) {
+          if (record.target) collect(record.target.parentElement || record.target);
+          for (const node of record.addedNodes || []) if (node.nodeType === 1) collect(node);
+        }
+      });
+      window.__pxxToastObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+    }).catch(() => {});
+  }
+}
+
+async function readPddToastMessages(page) {
+  const messages = [];
+  for (const frame of page.frames()) {
+    const found = await frame.evaluate(() => {
+      const selectors = '[class*="toast"],[class*="Toast"],[class*="message"],[class*="Message"],[class*="notice"],[role="alert"],[aria-live]';
+      const live = [...document.querySelectorAll(selectors)].filter((el) => el.getClientRects().length)
+        .map((el) => (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 300)).filter(Boolean);
+      return [...(window.__pxxToastMessages || []), ...live].slice(-20);
+    }).catch(() => []);
+    messages.push(...found);
+  }
+  return [...new Set(messages)].slice(-20);
+}
+
 async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
   // 先按 URL 判断当前所处阶段，避免拿详情页/登录页去套类目页选择器。
   const currentUrl = () => { try { return new URL(page.url()); } catch { return null; } };
@@ -769,7 +814,10 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
     if (!previewReady) {
       throw new Error(`首图文件已选择，但页面没有出现图片预览，已阻止进入下一步；选中的上传控件序号=${selectedIndex}；控件信息=${JSON.stringify(inputInfo)}`);
     }
-    await step("  类目页首图已选择并检测到页面图片预览");
+    const uploadToast = await readPddToastMessages(page);
+    const uploadFailure = uploadToast.find((t) => /上传失败|图片.*失败|请上传|图片不能为空|上传异常/.test(t));
+    if (uploadFailure) throw new Error(`拼多多首图上传提示失败：${uploadFailure}；上传控件序号=${selectedIndex}；控件信息=${JSON.stringify(inputInfo)}`);
+    await step(`  首图已选择且检测到预览；控件序号=${selectedIndex}；input文件数已验证；页面提示=${uploadToast.slice(-3).join(" | ") || "无"}`);
   } else {
     throw new Error("没有可用首图文件，已阻止进入拼多多下一步");
   }
@@ -781,9 +829,11 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
   if (!(await next.isVisible().catch(() => false))) {
     throw new Error(`类目页未出现“下一步，完善商品信息”；当前URL=${page.url()}；请检查首图/标题是否填写成功`);
   }
+  await armPddToastCapture(page);
   await next.click({ timeout: 10000 });
-  await step("  已点击下一步，等待商品详情页");
+  await step("  已点击下一步，监听拼多多页面跳转与提示");
   const deadline = Date.now() + 20000;
+  let lastToasts = [];
   while (Date.now() < deadline) {
     const form = context.pages().find((p) => isFormUrl(p.url()));
     if (form) {
@@ -791,9 +841,13 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
       return form;
     }
     if (isFormUrl(page.url())) return page;
-    await sleep(400);
+    lastToasts = await readPddToastMessages(page);
+    const rejection = lastToasts.find((t) => /请上传|上传失败|图片不能为空|请选择类目|请先|不能为空|校验失败|提交失败|操作失败/.test(t));
+    if (rejection) throw new Error(`拼多多阻止进入详情页，toast提示：${rejection}；当前URL=${page.url()}`);
+    await sleep(300);
   }
-  throw new Error(`点击下一步后未进入商品详情页（goods_add）；当前URL=${page.url()}`);
+  lastToasts = await readPddToastMessages(page);
+  throw new Error(`点击下一步后未进入商品详情页（goods_add）；当前URL=${page.url()}；捕获到的toast=${lastToasts.join(" | ") || "未捕获到可见toast"}`);
 }
 async function isPddLoginRequired(page) {
   let u;
