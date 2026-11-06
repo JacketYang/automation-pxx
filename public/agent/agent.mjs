@@ -580,7 +580,7 @@ async function addSpecs(page, product, step) {
   if (!dims.length || !product.skuRead) return;
   const nameInputs = page.locator('input[placeholder*="规格类型"], input[placeholder*="规格名"], input[placeholder*="请选择规格"]');
   const nameCount = await nameInputs.count();
-  const valueInputs = page.locator('input[placeholder*="规格值"], input[placeholder*="添加规格值"], input[placeholder*="输入规格"], input[placeholder*="自定义款式"], input[placeholder*="自定义组合"], input[placeholder="请输入"]');
+  const valueInputs = page.locator('input[placeholder*="规格值"], input[placeholder*="添加规格值"], input[placeholder*="输入规格"], input[placeholder="自定义款式"], input[placeholder="自定义组合"]');
   let valueCursor = 0;
   let added = 0;
   for (let i = 0; i < dims.length; i++) {
@@ -1029,10 +1029,21 @@ async function main() {
               tag: e.tagName, type: e.type || "", placeholder: e.getAttribute("placeholder") || "",
               name: e.getAttribute("name") || "", cls: typeof e.className === "string" ? e.className : "",
               ariaLabel: e.getAttribute("aria-label") || "", visible: visible(e),
+              parentText: (e.parentElement?.parentElement?.innerText || "").trim().slice(0, 120),
               // 不读取 value，避免把用户输入、密码或验证码写入诊断文件。
             })).slice(0, 500),
             buttons: [...document.querySelectorAll("button,[role=button]")].map(text).filter(Boolean).slice(0, 300),
             tables: [...document.querySelectorAll("table")].map((t) => [...t.querySelectorAll("thead th,thead td,tr:first-child th,tr:first-child td")].map(text)).slice(0, 100),
+            tableDetails: [...document.querySelectorAll("table")].slice(0, 30).map((t) => [...t.querySelectorAll("tr")].slice(0, 30).map((tr) => ({
+              text: (tr.innerText || "").trim().slice(0, 300),
+              cells: [...tr.querySelectorAll("th,td")].map((cell) => ({
+                text: (cell.innerText || "").trim().slice(0, 100),
+                inputs: [...cell.querySelectorAll("input,textarea,select")].map((e) => ({
+                  tag: e.tagName, type: e.type || "", placeholder: e.getAttribute("placeholder") || "",
+                  cls: typeof e.className === "string" ? e.className : "", visible: visible(e)
+                }))
+              }))
+            }))),
             shadowRoots: [...document.querySelectorAll("*")].filter((e) => e.shadowRoot).length,
           };
         }).catch((e) => ({ url: frame.url(), error: e.message }));
