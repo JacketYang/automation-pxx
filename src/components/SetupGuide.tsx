@@ -24,7 +24,7 @@ function Code({ children }: { children: string }) {
 
 export default function SetupGuide() {
   const [origin, setOrigin] = useState("https://你的控制台地址");
-  const [os, setOs] = useState<"unix" | "win">("unix");
+  const [os, setOs] = useState<"unix" | "win">("win");
   useEffect(() => setOrigin(window.location.origin), []);
 
   const download =
