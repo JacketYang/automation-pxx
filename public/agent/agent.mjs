@@ -466,6 +466,36 @@ async function downloadImages(urls, dir, prefix, step) {
 const PDD_CATEGORY_URL = "https://mms.pinduoduo.com/goods/category";
 const isFormUrl = (u) => /goods_add|goods_edit|goods\/edit|goods\/add/.test(u);
 
+// 拼多多首图控件的 accept 只有 image/jpeg,image/png，而 1688 对 Chrome UA 常返回 webp。
+// downloadImages 的扩展名来自 content-type，不可信，一律按文件头判定真实格式。
+const PDD_IMAGE_KINDS = ["jpeg", "png"];
+
+function sniffImageKind(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const head = Buffer.alloc(16);
+    const n = fs.readSync(fd, head, 0, 16, 0);
+    if (n >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return "jpeg";
+    if (n >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "png";
+    if (n >= 12 && head.subarray(0, 4).toString("latin1") === "RIFF" &&
+        head.subarray(8, 12).toString("latin1") === "WEBP") return "webp";
+    if (n >= 6 && head.subarray(0, 6).toString("latin1").startsWith("GIF8")) return "gif";
+    if (n >= 2 && head[0] === 0x42 && head[1] === 0x4d) return "bmp";
+    return "unknown";
+  } catch {
+    return "unreadable";
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+// 首图优先取真实格式为 jpeg/png 的那张；全都不合时仍返回第一张，
+// 由 uploadCategoryCover 报出具体格式，而不是在这里悄悄换图或假装没图。
+function pickCoverImage(gallery) {
+  return gallery.find((f) => PDD_IMAGE_KINDS.includes(sniffImageKind(f))) || gallery[0];
+}
+
 async function clickText(page, re, timeout = 4000) {
   const cands = [
     page.getByRole("button", { name: re }),
@@ -657,6 +687,16 @@ async function uploadCategoryCover(page, imagePath, step) {
   const stat = fs.statSync(imagePath);
   if (!stat.size) throw new Error("首图文件大小为 0，无法上传");
 
+  // 拼多多前端按 File.type 拒绝 accept 之外的格式：文件照样塞得进 input.files，
+  // 但计数永远是 (0/10)。不先判格式就会把格式问题当成选择器问题排查 25 秒。
+  const kind = sniffImageKind(imagePath);
+  if (!PDD_IMAGE_KINDS.includes(kind)) {
+    throw new Error(
+      `首图真实格式为 ${kind}（按文件头判定，不看扩展名），拼多多首图控件只接受 jpeg/png：${imagePath}`
+    );
+  }
+  await step(`  首图格式校验通过：${kind}`);
+
   // 拼多多当前 DOM 已确认：隐藏 file input 位于“本地上传”按钮内部。
   // 直接 setInputFiles 会被组件清空；必须走真实按钮触发的 filechooser。
   const candidates = [];
@@ -677,7 +717,7 @@ async function uploadCategoryCover(page, imagePath, step) {
           inputClass: String(el.className || ""),
           buttonText: (button?.innerText || "").trim(),
           buttonClass: String(button?.className || ""),
-          sectionText: (section?.innerText || "").trim().replace(/\\s+/g, " ").slice(0, 220),
+          sectionText: (section?.innerText || "").trim().replace(/\s+/g, " ").slice(0, 220),
           sectionClass: String(section?.className || ""),
           sectionImages: section?.querySelectorAll("img").length || 0
         };
@@ -703,7 +743,7 @@ async function uploadCategoryCover(page, imagePath, step) {
         const section = el.closest('[class*="goodsCarousel_uploadImgEnter"]') ||
           el.closest('section[class*="goodsCarousel"]');
         return {
-          sectionText: (section?.innerText || "").trim().replace(/\\s+/g, " "),
+          sectionText: (section?.innerText || "").trim().replace(/\s+/g, " "),
           sectionImages: section?.querySelectorAll("img").length || 0,
           bodyImages: document.querySelectorAll("img").length
         };
@@ -721,11 +761,11 @@ async function uploadCategoryCover(page, imagePath, step) {
         verified = await input.evaluate((el, oldState) => {
           const section = el.closest('[class*="goodsCarousel_uploadImgEnter"]') ||
             el.closest('section[class*="goodsCarousel"]');
-          const sectionText = (section?.innerText || "").trim().replace(/\\s+/g, " ");
+          const sectionText = (section?.innerText || "").trim().replace(/\s+/g, " ");
           const sectionImages = section?.querySelectorAll("img").length || 0;
           const bodyImages = document.querySelectorAll("img").length;
-          const countMatch = sectionText.match(/上传图片\\s*[（(](\\d+)\\s*\\/\\s*10[）)]/);
-          const oldCountMatch = oldState.sectionText.match(/上传图片\\s*[（(](\\d+)\\s*\\/\\s*10[）)]/);
+          const countMatch = sectionText.match(/上传图片\s*[（(](\d+)\s*\/\s*10[）)]/);
+          const oldCountMatch = oldState.sectionText.match(/上传图片\s*[（(](\d+)\s*\/\s*10[）)]/);
           const countIncreased = !!(countMatch && (!oldCountMatch || Number(countMatch[1]) > Number(oldCountMatch[1])));
           const imageIncreased = sectionImages > oldState.sectionImages;
           const uploadedState = /重新上传|更换图片|删除图片/.test(sectionText);
@@ -873,7 +913,7 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   }
   for (let i = 0; i < 3; i++) if (!(await clickText(page, /^(我知道了|知道了|以后再说|暂不|跳过)$/, 1500))) break;
 
-  page = await prepareCategoryPage(page, context, pddTitle, files.gallery[0], step);
+  page = await prepareCategoryPage(page, context, pddTitle, pickCoverImage(files.gallery), step);
   await page.bringToFront();
   await sleep(1800);
 
@@ -1134,7 +1174,7 @@ async function main() {
         let body = {};
         try { body = JSON.parse(raw || "{}"); } catch {}
         const mode = ["check", "fill", "publish"].includes(body.mode) ? body.mode : "fill";
-        const lines = String(body.urls || "").split(/[\\s,，;；]+/).map(x => x.trim()).filter(Boolean);
+        const lines = String(body.urls || "").split(/[\s,，;；]+/).map(x => x.trim()).filter(Boolean);
         const ids = [...new Set(lines.map(parseOfferId).filter(Boolean))];
         if (!ids.length) { res.writeHead(400); res.end(JSON.stringify({ error: "没有识别到有效的 1688 商品链接" })); return; }
         const created = ids.map(offerId => {
