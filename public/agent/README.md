@@ -1,37 +1,16 @@
-# 本机 Agent
+# PXX 本机 Agent
 
-Agent 在你的 Windows 电脑运行，使用本机 Chrome/Edge 登录态读取 1688 并操作拼多多商家后台。无需数据库、云端服务、Token 或环境变量。
-
-## 安装
-
-下载本目录中的 `agent.mjs`、`package.json`、`pricing.mjs`、`pricing.test.mjs`，放在同一目录：
-
-```powershell
-npm install
-npm test
-node agent.mjs login
-```
-
-在弹出的浏览器中登录 1688 和拼多多商家后台。
+## 首次安装（Windows）
+1. 安装 Node.js 18+ 和 Chrome 或 Edge。
+2. 在此目录运行 `npm install`。
+3. 首次登录：`node agent.mjs login`，在打开的浏览器中登录 1688 和拼多多。
+4. 以后双击 `start-agent.bat`。Agent 启动后网页会自动显示在线。
 
 ## 使用
+打开已部署的 HTTPS 控制台，等待右上角显示 Agent 在线。直接在网页粘贴 1688 商品链接，选择只分析、分析并填表或分析并提交，然后点击开始处理。任务进度、SKU 定价、风险判断和日志会直接显示在网页。
 
-```powershell
-node agent.mjs check "1688商品链接"
-node agent.mjs list "1688商品链接"
-node agent.mjs list "1688商品链接" --submit
-```
+Agent 提供本机 HTTP 服务：`http://127.0.0.1:17368`，仅监听回环地址，不暴露到局域网或公网。网页和 Agent 之间不经过云端任务队列。登录态保存在本机 `chrome-profile`。
 
-- `check`：只判断商品能否上架并分析价格。
-- `list`：判断并填写拼多多表单，停在最终提交前。
-- `list --submit`：提交发布；初期建议人工检查后提交。
+命令行可选：`node agent.mjs login`、`node agent.mjs start`、`node agent.mjs check <1688链接>`、`node agent.mjs list <1688链接>`。运行测试：`node --test pricing.test.mjs`。
 
-## 定价
-
-默认平台费率 0.6%、售后损耗 3%、目标 ROI 2、目标经营利润 ¥3。逐 SKU 使用公式：
-
-`售价 × (1 - 平台费率 - 售后损耗率 - 1/目标 ROI) - 商品成本 - 单件运费 - 其他成本 ≥ 目标利润`
-
-必须有明确的一件代发价和单件运费/包邮证据；否则不自动上架。参数是经营估算，应按店铺实际账单校准。
-
-登录态只保存在本机 `chrome-profile`，不要分享或上传。
+不要上传 `chrome-profile`，不要分享密码或验证码。Agent 不需要 Token、数据库或云端任务队列。
