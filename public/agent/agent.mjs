@@ -632,6 +632,46 @@ async function pickCategory(page, context, pddTitle, cfg, step) {
   return findForm() || page;
 }
 
+async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
+  await step("拼多多阶段 1/2：首图、标题与自动类目", { stage: "拼多多：填写标题并识别类目" });
+
+  // 类目页先上传首图，再填写标题；标题失焦后由拼多多自动推荐/选择类目。
+  const title = page.locator('input[placeholder*="商品描述+规格"], input[placeholder*="最多输入30个汉字"]').first();
+  if (!(await title.isVisible().catch(() => false))) {
+    throw new Error("类目页未找到商品标题输入框；请确认当前位于 /goods/category");
+  }
+  if (firstImage) {
+    const fileInput = page.locator('input[type="file"]').first();
+    if (!(await fileInput.count())) throw new Error("类目页未找到首图上传控件");
+    await fileInput.setInputFiles(firstImage);
+    await sleep(1800);
+    await step("  类目页首图已上传");
+  } else {
+    await step("⚠ 没有可用首图文件，跳过类目页首图上传");
+  }
+  await title.fill(pddTitle);
+  await title.press("Tab"); // 触发 blur，等待平台自动识别类目
+  await sleep(2600);
+
+  const next = page.getByText(/下一步[，, ]*完善商品信息/).first();
+  if (!(await next.isVisible().catch(() => false))) {
+    throw new Error("类目页未出现“下一步，完善商品信息”；请检查首图/标题是否填写成功");
+  }
+  await next.click({ timeout: 10000 });
+  await step("  已点击下一步，等待商品详情页");
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const form = context.pages().find((p) => isFormUrl(p.url()));
+    if (form) {
+      await form.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => {});
+      return form;
+    }
+    if (isFormUrl(page.url())) return page;
+    await sleep(400);
+  }
+  throw new Error("点击下一步后未进入商品详情页（goods_add）；请在浏览器确认类目并重试");
+}
+
 async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, mode, step }) {
   let page = await context.newPage();
   await step("打开拼多多商家后台发布页", { stage: "拼多多：打开发布页" });
@@ -645,10 +685,9 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   }
   for (let i = 0; i < 3; i++) if (!(await clickText(page, /^(我知道了|知道了|以后再说|暂不|跳过)$/, 1500))) break;
 
-  await step("选择类目", { stage: "拼多多：选择类目" });
-  page = await pickCategory(page, context, pddTitle, cfg, step);
+  page = await prepareCategoryPage(page, context, pddTitle, files.gallery[0], step);
   await page.bringToFront();
-  await sleep(2500);
+  await sleep(1800);
 
   const problems = [];
   const attempt = async (name, fn) => {
