@@ -22,6 +22,7 @@ import { priceSku } from "./pricing.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
+import { createServer } from "node:http";
 
 const MAX_PRICE_MULTIPLE = 3.5;
 const UA =
@@ -78,8 +79,17 @@ const round2 = (n) => Math.round(n * 100) / 100;
 const uniq = (a) => [...new Set(a)];
 const ts = () => new Date().toLocaleTimeString();
 
-function makeStep() {
-  return async (msg) => console.log(`[${ts()}] ${msg}`);
+function makeStep(job) {
+  const step = async (msg, patch = {}) => {
+    console.log(`[${ts()}] ${msg}`);
+    if (job) {
+      job.logs.push({ t: new Date().toISOString(), m: msg });
+      if (job.logs.length > 300) job.logs.shift();
+      Object.assign(job, patch, { updatedAt: new Date().toISOString() });
+    }
+  };
+  step.report = async (patch) => { if (job) Object.assign(job, patch, { updatedAt: new Date().toISOString() }); };
+  return step;
 }
 
 async function waitForHuman(page, isDone, msg, step, timeoutMs = 10 * 60 * 1000) {
@@ -830,6 +840,84 @@ async function main() {
     await sleep(2500);
     console.log("拼多多登录态：", /login|passport/.test(p2.url()) ? "⚠ 仍在登录页" : "✔ 已登录");
     await close();
+    return;
+  }
+
+  if (cmd === "start") {
+    const PORT = Number(flags.port || 17368);
+    const jobs = [];
+    let nextId = 1;
+    let active = false;
+    let context;
+    let browserClose;
+    const allowedOrigin = (origin) => {
+      if (!origin) return true;
+      try {
+        const u = new URL(origin);
+        return u.protocol === "https:" || u.hostname === "localhost" || u.hostname === "127.0.0.1";
+      } catch { return false; }
+    };
+    const server = createServer(async (req, res) => {
+      const origin = req.headers.origin || "";
+      if (!allowedOrigin(origin)) { res.writeHead(403); res.end("Origin denied"); return; }
+      if (origin) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+      }
+      if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200); res.end(JSON.stringify({ online: true, version: "1.1.0", host: process.env.COMPUTERNAME || "本机", active, port: PORT })); return;
+      }
+      if (req.method === "GET" && req.url === "/jobs") {
+        res.writeHead(200); res.end(JSON.stringify({ jobs: jobs.slice().reverse() })); return;
+      }
+      if (req.method === "POST" && req.url === "/jobs") {
+        let raw = "";
+        for await (const chunk of req) raw += chunk;
+        let body = {};
+        try { body = JSON.parse(raw || "{}"); } catch {}
+        const mode = ["check", "fill", "publish"].includes(body.mode) ? body.mode : "fill";
+        const lines = String(body.urls || "").split(/[\\s,，;；]+/).map(x => x.trim()).filter(Boolean);
+        const ids = [...new Set(lines.map(parseOfferId).filter(Boolean))];
+        if (!ids.length) { res.writeHead(400); res.end(JSON.stringify({ error: "没有识别到有效的 1688 商品链接" })); return; }
+        const created = ids.map(offerId => {
+          const job = { id: nextId++, offerId, sourceUrl: `https://detail.1688.com/offer/${offerId}.html`, mode, status: "queued", stage: "排队中", logs: [], createdAt: new Date().toISOString() };
+          jobs.push(job); return job;
+        });
+        res.writeHead(202); res.end(JSON.stringify({ created: created.length, jobs: created })); return;
+      }
+      res.writeHead(404); res.end(JSON.stringify({ error: "not found" }));
+    });
+    server.listen(PORT, "127.0.0.1", async () => {
+      console.log(`✔ PXX Agent 已连接本机服务：http://127.0.0.1:${PORT}`);
+      console.log("请保持此窗口运行；网页会自动检测连接并直接发送任务。");
+      try {
+        const opened = await openBrowser();
+        context = opened.context;
+        browserClose = opened.close;
+        context.on("close", () => { console.log("浏览器已关闭"); });
+        while (true) {
+          const job = jobs.find(x => x.status === "queued");
+          if (!job) { await sleep(700); continue; }
+          active = true;
+          job.status = "running";
+          job.stage = "开始处理";
+          const step = makeStep(job);
+          await runJob({ context, job, cfg: loadLocalConfig(), step, mode: job.mode });
+          if (job.status === "running") { job.status = "failed"; job.stage = "任务结束但未返回结果"; }
+          job.updatedAt = new Date().toISOString();
+          active = false;
+        }
+      } catch (e) {
+        console.error("Agent 启动失败：", e?.message || e);
+        server.close();
+        process.exitCode = 1;
+      }
+    });
+    server.on("error", e => { console.error("本机服务启动失败：", e.message); process.exitCode = 1; });
     return;
   }
 
