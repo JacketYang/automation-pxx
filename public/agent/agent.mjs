@@ -580,7 +580,7 @@ async function addSpecs(page, product, step) {
   if (!dims.length || !product.skuRead) return;
   const nameInputs = page.locator('input[placeholder*="规格类型"], input[placeholder*="规格名"], input[placeholder*="请选择规格"]');
   const nameCount = await nameInputs.count();
-  const valueInputs = page.locator('input[placeholder*="规格值"], input[placeholder*="添加规格值"], input[placeholder*="输入规格"], input[placeholder="自定义款式"], input[placeholder="自定义组合"]');
+  const valueInputs = page.locator('input[placeholder*="规格值"], input[placeholder*="添加规格值"], input[placeholder*="输入规格"], input[placeholder="请输入规格名称"], input[placeholder="自定义款式"], input[placeholder="自定义组合"]');
   let valueCursor = 0;
   let added = 0;
   for (let i = 0; i < dims.length; i++) {
