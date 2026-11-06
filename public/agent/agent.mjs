@@ -697,6 +697,122 @@ async function readPddToastMessages(page) {
   return [...new Set(messages)].slice(-20);
 }
 
+async function uploadCategoryCover(page, imagePath, step) {
+  if (!imagePath || !fs.existsSync(imagePath)) {
+    throw new Error(`首图文件不存在：${imagePath || "(empty)"}`);
+  }
+  const stat = fs.statSync(imagePath);
+  if (!stat.size) throw new Error("首图文件大小为 0，无法上传");
+
+  const candidates = [];
+  const diagnostics = [];
+  for (const frame of page.frames()) {
+    const inputs = frame.locator('input[type="file"]');
+    const count = await inputs.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const input = inputs.nth(i);
+      const info = await input.evaluate((el) => {
+        const chain = [];
+        let node = el;
+        for (let depth = 0; depth < 7 && node; depth++, node = node.parentElement) {
+          chain.push({
+            tag: node.tagName,
+            cls: String(node.className || "").slice(0, 140),
+            text: (node.innerText || "").trim().replace(/\\s+/g, " ").slice(0, 180),
+            images: node.querySelectorAll ? node.querySelectorAll("img").length : 0
+          });
+        }
+        const label = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
+        return {
+          accept: el.getAttribute("accept") || "",
+          multiple: el.multiple,
+          disabled: el.disabled,
+          visible: !!el.getClientRects().length,
+          id: el.id || "",
+          name: el.name || "",
+          labelText: (label?.innerText || "").trim(),
+          chain
+        };
+      }).catch((e) => ({ error: e.message, accept: "", chain: [] }));
+      const contextText = [info.labelText, ...(info.chain || []).map(x => x.text)].join(" ");
+      const imageAccept = /image/i.test(info.accept || "");
+      const imageContext = /主图|首图|商品图片|上传图片|图片上传|商品首图/.test(contextText);
+      const excludedContext = /视频|详情图|轮播图|资质|包装标签/.test(contextText);
+      const score = (imageAccept ? 100 : 0) + (imageContext ? 60 : 0) +
+        (/主图|首图|商品首图/.test(contextText) ? 40 : 0) +
+        (info.visible ? 5 : 0) - (excludedContext ? 150 : 0);
+      diagnostics.push({ frameUrl: frame.url(), index: i, ...info, score });
+      if (!info.disabled && !excludedContext && (imageAccept || imageContext)) {
+        candidates.push({ frame, input, index: i, info, score });
+      }
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  if (!candidates.length) {
+    throw new Error(`没有定位到拼多多首图上传控件；已扫描所有 frame。控件诊断=${JSON.stringify(diagnostics)}`);
+  }
+
+  const attempts = [];
+  for (const candidate of candidates) {
+    const { frame, input, index, info } = candidate;
+    try {
+      const before = await input.evaluate((el) => {
+        const chain = [];
+        let node = el;
+        for (let depth = 0; depth < 7 && node; depth++, node = node.parentElement) {
+          chain.push(node);
+        }
+        return chain.map((node) => [...node.querySelectorAll("img")].map((img) => img.currentSrc || img.src || ""));
+      });
+      await input.setInputFiles(imagePath, { timeout: 15000 });
+      const fileState = await input.evaluate((el) => ({
+        count: el.files?.length || 0,
+        name: el.files?.[0]?.name || "",
+        size: el.files?.[0]?.size || 0,
+        type: el.files?.[0]?.type || ""
+      }));
+      if (!fileState.count || !fileState.size) {
+        attempts.push({ frameUrl: frame.url(), index, reason: "input.files 为空", fileState });
+        continue;
+      }
+
+      const deadline = Date.now() + 18000;
+      let verified = null;
+      while (Date.now() < deadline) {
+        verified = await input.evaluate((el, oldImages) => {
+          let node = el;
+          for (let depth = 0; depth < 7 && node; depth++, node = node.parentElement) {
+            const imgs = [...node.querySelectorAll("img")];
+            const sources = imgs.map((img) => img.currentSrc || img.src || "");
+            const added = sources.filter((src) => src && !oldImages.flat().includes(src) &&
+              !/logo|icon|avatar|sprite/i.test(src));
+            const text = (node.innerText || "").trim().replace(/\\s+/g, " ").slice(0, 220);
+            const hasUploadedState = /重新上传|更换图片|删除图片|上传成功/.test(text);
+            if (added.length || hasUploadedState) {
+              return { ok: true, addedImages: added.slice(0, 5), imageCount: imgs.length, text, depth };
+            }
+          }
+          return { ok: false };
+        }, before).catch(() => ({ ok: false }));
+        if (verified?.ok) break;
+        await sleep(400);
+      }
+      if (verified?.ok) {
+        await step(`  首图上传已验证：${fileState.name}（${Math.round(fileState.size / 1024)} KB），命中上传控件 index=${index}`);
+        return { frame, index, fileState, verified };
+      }
+      attempts.push({
+        frameUrl: frame.url(), index, accept: info.accept, labelText: info.labelText,
+        parentText: (info.chain || []).map(x => x.text).filter(Boolean).slice(0, 3),
+        reason: "文件已绑定，但上传区域未出现新图片/上传完成状态", fileState
+      });
+    } catch (e) {
+      attempts.push({ frameUrl: frame.url(), index, reason: e.message });
+    }
+  }
+  throw new Error(`已尝试所有疑似首图控件，但没有验证到图片上传成功。尝试记录=${JSON.stringify(attempts)}；控件诊断=${JSON.stringify(diagnostics)}`);
+}
+
 async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
   // 先按 URL 判断当前所处阶段，避免拿详情页/登录页去套类目页选择器。
   const currentUrl = () => { try { return new URL(page.url()); } catch { return null; } };
@@ -747,81 +863,7 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
     const frames = page.frames().map(f => f.url()).join(" | ");
     throw new Error(`类目页标题框未找到；当前URL=${page.url()}；是否类目页=${isCategoryUrl(page.url())}；frames=${frames}`);
   }
-  if (firstImage) {
-    const allFileInputs = titleFrame.locator('input[type="file"]');
-    const inputCount = await allFileInputs.count();
-    if (!inputCount) {
-      throw new Error(`类目页未找到首图上传控件；当前URL=${page.url()}；frame=${titleFrame.url()}`);
-    }
-
-    // 页面可能同时存在视频、详情图等多个 file input，不能盲目使用第一个。
-    const candidates = [];
-    const inputInfo = [];
-    for (let i = 0; i < inputCount; i++) {
-      const input = allFileInputs.nth(i);
-      const info = await input.evaluate((el) => ({
-        accept: el.getAttribute("accept") || "",
-        multiple: el.multiple,
-        visible: !!el.getClientRects().length,
-        parentText: (el.parentElement?.parentElement?.innerText || el.parentElement?.innerText || "").trim().slice(0, 100),
-      })).catch(() => ({ accept: "", multiple: false, visible: false, parentText: "" }));
-      inputInfo.push(info);
-      if (!info.accept || /image/i.test(info.accept)) candidates.push(i);
-    }
-    if (!candidates.length) {
-      throw new Error(`类目页没有可用于图片的上传控件；inputs=${JSON.stringify(inputInfo)}`);
-    }
-
-    await armPddToastCapture(page);
-    const beforeImages = await titleFrame.locator("img").count().catch(() => 0);
-    let attached = false;
-    let selectedIndex = -1;
-    for (const index of candidates) {
-      const input = allFileInputs.nth(index);
-      try {
-        await input.setInputFiles(firstImage, { timeout: 10000 });
-        const fileCount = await input.evaluate((el) => el.files?.length || 0).catch(() => 0);
-        if (fileCount > 0) {
-          attached = true;
-          selectedIndex = index;
-          break;
-        }
-      } catch {}
-    }
-    if (!attached) {
-      throw new Error(`首图文件未能绑定到拼多多上传控件；inputs=${JSON.stringify(inputInfo)}`);
-    }
-
-    // setInputFiles 成功只代表文件已交给 input，不代表页面上传成功。
-    // 必须观察到页面新增图片预览才允许进入下一步，防止出现“日志显示已上传但实际没有图片”。
-    let previewReady = false;
-    const previewDeadline = Date.now() + 10000;
-    while (Date.now() < previewDeadline) {
-      const previewState = await titleFrame.evaluate((before) => {
-        const imgs = [...document.querySelectorAll("img")];
-        const previewImages = imgs.filter((img) => {
-          const src = img.currentSrc || img.src || "";
-          return src.startsWith("blob:") || src.startsWith("data:") ||
-            (!!src && !/logo|icon|avatar|sprite/i.test(src));
-        });
-        return { imageCount: imgs.length, previewCount: previewImages.length, hasBlob: previewImages.some((img) => /^(blob:|data:)/.test(img.currentSrc || img.src || "")) };
-      }, beforeImages).catch(() => ({ imageCount: 0, previewCount: 0, hasBlob: false }));
-      if (previewState.imageCount > beforeImages || previewState.hasBlob) {
-        previewReady = true;
-        break;
-      }
-      await sleep(500);
-    }
-    if (!previewReady) {
-      throw new Error(`首图文件已选择，但页面没有出现图片预览，已阻止进入下一步；选中的上传控件序号=${selectedIndex}；控件信息=${JSON.stringify(inputInfo)}`);
-    }
-    const uploadToast = await readPddToastMessages(page);
-    const uploadFailure = uploadToast.find((t) => /上传失败|图片.*失败|请上传|图片不能为空|上传异常/.test(t));
-    if (uploadFailure) throw new Error(`拼多多首图上传提示失败：${uploadFailure}；上传控件序号=${selectedIndex}；控件信息=${JSON.stringify(inputInfo)}`);
-    await step(`  首图已选择且检测到预览；控件序号=${selectedIndex}；input文件数已验证；页面提示=${uploadToast.slice(-3).join(" | ") || "无"}`);
-  } else {
-    throw new Error("没有可用首图文件，已阻止进入拼多多下一步");
-  }
+  await uploadCategoryCover(page, firstImage, step);
   await title.fill(pddTitle);
   await title.press("Tab");
   await sleep(2600);
@@ -830,7 +872,6 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
   if (!(await next.isVisible().catch(() => false))) {
     throw new Error(`类目页未出现“下一步，完善商品信息”；当前URL=${page.url()}；请检查首图/标题是否填写成功`);
   }
-  await armPddToastCapture(page);
   await next.click({ timeout: 10000 });
   await step("  已点击下一步，监听拼多多页面跳转与提示");
   const deadline = Date.now() + 20000;
