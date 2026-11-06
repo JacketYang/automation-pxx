@@ -697,7 +697,7 @@ async function isPddLoginRequired(page) {
   try { u = new URL(page.url()); } catch { return true; }
   const host = u.hostname.toLowerCase();
   const path = u.pathname.toLowerCase();
-  if (/^(login|passport)(\\.|$)/.test(host) || /(^|\\/)(login|passport)(\\/|$)/.test(path)) return true;
+  if (/^(login|passport)(\.|$)/.test(host) || /(^|\/)(login|passport)(\/|$)/.test(path)) return true;
 
   // 不再用“页面出现账号登录/手机登录文字”作为唯一依据，避免把普通页面文案误判成未登录。
   const visibleLoginControl = await page.locator(
@@ -718,8 +718,12 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   if (await isPddLoginRequired(page)) {
     await step(`  当前拼多多页面需要登录：${page.url()}`);
     await waitForHuman(page, async () => {
-      const ready = context.pages().find(async (p) => !(await isPddLoginRequired(p)));
-      if (ready) page = ready;
+      for (const candidate of context.pages()) {
+        if (/mms\\.pinduoduo\\.com/.test(candidate.url()) && !(await isPddLoginRequired(candidate))) {
+          page = candidate;
+          return true;
+        }
+      }
       return !(await isPddLoginRequired(page));
     }, "请在当前弹出的拼多多浏览器页面完成登录；登录成功后会自动继续", step);
     if (!/mms\\.pinduoduo\\.com/.test(page.url())) {
