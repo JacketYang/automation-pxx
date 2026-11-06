@@ -657,6 +657,8 @@ async function uploadCategoryCover(page, imagePath, step) {
   const stat = fs.statSync(imagePath);
   if (!stat.size) throw new Error("首图文件大小为 0，无法上传");
 
+  // 拼多多当前 DOM 已确认：隐藏 file input 位于“本地上传”按钮内部。
+  // 直接 setInputFiles 会被组件清空；必须走真实按钮触发的 filechooser。
   const candidates = [];
   const diagnostics = [];
   for (const frame of page.frames()) {
@@ -665,102 +667,96 @@ async function uploadCategoryCover(page, imagePath, step) {
     for (let i = 0; i < count; i++) {
       const input = inputs.nth(i);
       const info = await input.evaluate((el) => {
-        const chain = [];
-        let node = el;
-        for (let depth = 0; depth < 7 && node; depth++, node = node.parentElement) {
-          chain.push({
-            tag: node.tagName,
-            cls: String(node.className || "").slice(0, 140),
-            text: (node.innerText || "").trim().replace(/\s+/g, " ").slice(0, 180),
-            images: node.querySelectorAll ? node.querySelectorAll("img").length : 0
-          });
-        }
-        const label = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
+        const button = el.closest("button");
+        const section = el.closest('section[class*="goodsCarousel"]') ||
+          el.closest('[class*="goodsCarousel_uploadImgEnter"]');
         return {
           accept: el.getAttribute("accept") || "",
           multiple: el.multiple,
           disabled: el.disabled,
-          visible: !!el.getClientRects().length,
-          id: el.id || "",
-          name: el.name || "",
-          labelText: (label?.innerText || "").trim(),
-          chain
+          inputClass: String(el.className || ""),
+          buttonText: (button?.innerText || "").trim(),
+          buttonClass: String(button?.className || ""),
+          sectionText: (section?.innerText || "").trim().replace(/\\s+/g, " ").slice(0, 220),
+          sectionClass: String(section?.className || ""),
+          sectionImages: section?.querySelectorAll("img").length || 0
         };
-      }).catch((e) => ({ error: e.message, accept: "", chain: [] }));
-      const localChain = (info.chain || []).slice(0, 3);
-      const contextText = [info.labelText, ...localChain.map(x => x.text)].join(" ");
-      const imageAccept = /image/i.test(info.accept || "");
-      const imageContext = /主图|首图|商品图片|上传图片|图片上传|商品首图/.test(contextText);
-      const excludedContext = /视频|详情图|轮播图|资质|包装标签/.test(contextText);
-      const score = (imageAccept ? 100 : 0) + (imageContext ? 60 : 0) +
-        (/主图|首图|商品首图/.test(contextText) ? 40 : 0) +
-        (info.visible ? 5 : 0) - (excludedContext ? 150 : 0);
-      diagnostics.push({ frameUrl: frame.url(), index: i, ...info, score });
-      if (!info.disabled && !excludedContext && (imageAccept || imageContext)) {
-        candidates.push({ frame, input, index: i, info, score });
-      }
+      }).catch((e) => ({ error: e.message }));
+      diagnostics.push({ frameUrl: frame.url(), index: i, ...info });
+      const isLocalImageUpload =
+        /image/i.test(info.accept || "") &&
+        /本地上传/.test(info.buttonText || "") &&
+        /goodsCarousel/.test((info.inputClass || "") + " " + (info.sectionClass || ""));
+      if (!info.disabled && isLocalImageUpload) candidates.push({ frame, input, index: i, info });
     }
   }
-  candidates.sort((a, b) => b.score - a.score);
-  if (!candidates.length) throw new Error(`没有定位到拼多多首图上传控件；已扫描所有 frame。控件诊断=${JSON.stringify(diagnostics)}`);
+
+  if (!candidates.length) {
+    throw new Error(`未找到拼多多商品轮播图区域的“本地上传”控件。控件诊断=${JSON.stringify(diagnostics)}`);
+  }
 
   const attempts = [];
   for (const candidate of candidates) {
     const { frame, input, index, info } = candidate;
     try {
       const before = await input.evaluate((el) => {
-        const chain = [];
-        let node = el;
-        for (let depth = 0; depth < 7 && node; depth++, node = node.parentElement) chain.push(node);
-        return chain.map((node) => [...node.querySelectorAll("img")].map((img) => img.currentSrc || img.src || ""));
+        const section = el.closest('section[class*="goodsCarousel"]') ||
+          el.closest('[class*="goodsCarousel_uploadImgEnter"]');
+        return {
+          sectionText: (section?.innerText || "").trim().replace(/\\s+/g, " "),
+          sectionImages: section?.querySelectorAll("img").length || 0,
+          bodyImages: document.querySelectorAll("img").length
+        };
       });
-      await input.setInputFiles(imagePath, { timeout: 15000 });
-      const fileState = await input.evaluate((el) => ({
-        count: el.files?.length || 0,
-        name: el.files?.[0]?.name || "",
-        size: el.files?.[0]?.size || 0,
-        type: el.files?.[0]?.type || ""
-      }));
-      if (!fileState.count || !fileState.size) {
-        attempts.push({ frameUrl: frame.url(), index, reason: "input.files 为空", fileState });
-        continue;
-      }
 
-      const deadline = Date.now() + 18000;
+      const button = input.locator("xpath=..");
+      const chooserPromise = frame.page().waitForEvent("filechooser", { timeout: 10000 });
+      await button.click({ timeout: 10000 });
+      const chooser = await chooserPromise;
+      await chooser.setFiles(imagePath);
+
+      const deadline = Date.now() + 25000;
       let verified = null;
       while (Date.now() < deadline) {
-        verified = await input.evaluate((el, oldImages) => {
-          let node = el;
-          for (let depth = 0; depth < 7 && node; depth++, node = node.parentElement) {
-            const imgs = [...node.querySelectorAll("img")];
-            const sources = imgs.map((img) => img.currentSrc || img.src || "");
-            const added = sources.filter((src) => src && !oldImages.flat().includes(src) &&
-              !/logo|icon|avatar|sprite/i.test(src));
-            const text = (node.innerText || "").trim().replace(/\s+/g, " ").slice(0, 220);
-            const hasUploadedState = /重新上传|更换图片|删除图片|上传成功/.test(text);
-            if (added.length || hasUploadedState) {
-              return { ok: true, addedImages: added.slice(0, 5), imageCount: imgs.length, text, depth };
-            }
-          }
-          return { ok: false };
-        }, before).catch(() => ({ ok: false }));
+        verified = await input.evaluate((el, oldState) => {
+          const section = el.closest('section[class*="goodsCarousel"]') ||
+            el.closest('[class*="goodsCarousel_uploadImgEnter"]');
+          const sectionText = (section?.innerText || "").trim().replace(/\\s+/g, " ");
+          const sectionImages = section?.querySelectorAll("img").length || 0;
+          const bodyImages = document.querySelectorAll("img").length;
+          const countMatch = sectionText.match(/上传图片\\s*[（(](\\d+)\\s*\\/\\s*10[）)]/);
+          const oldCountMatch = oldState.sectionText.match(/上传图片\\s*[（(](\\d+)\\s*\\/\\s*10[）)]/);
+          const countIncreased = !!(countMatch && (!oldCountMatch || Number(countMatch[1]) > Number(oldCountMatch[1])));
+          const imageIncreased = sectionImages > oldState.sectionImages;
+          const uploadedState = /重新上传|更换图片|删除图片/.test(sectionText);
+          return {
+            ok: countIncreased || imageIncreased || uploadedState,
+            sectionText,
+            sectionImages,
+            bodyImages,
+            countIncreased,
+            imageIncreased,
+            uploadedState
+          };
+        }, before).catch((e) => ({ ok: false, error: e.message }));
         if (verified?.ok) break;
-        await sleep(400);
+        await sleep(500);
       }
+
       if (verified?.ok) {
-        await step(`  首图上传已验证：${fileState.name}（${Math.round(fileState.size / 1024)} KB），命中上传控件 index=${index}`);
-        return { frame, index, fileState, verified };
+        await step(`  首图上传已验证：拼多多轮播图区域状态已变化（控件 index=${index}）`);
+        return { frame, index, verified };
       }
       attempts.push({
-        frameUrl: frame.url(), index, accept: info.accept, labelText: info.labelText,
-        parentText: (info.chain || []).slice(0, 3).map(x => x.text).filter(Boolean),
-        reason: "文件已绑定，但上传区域未出现新图片/上传完成状态", fileState
+        frameUrl: frame.url(), index, buttonText: info.buttonText,
+        reason: "已通过本地上传按钮选择文件，但轮播图区域没有出现上传计数/预览变化",
+        before, after: verified
       });
     } catch (e) {
       attempts.push({ frameUrl: frame.url(), index, reason: e.message });
     }
   }
-  throw new Error(`已尝试所有疑似首图控件，但没有验证到图片上传成功。尝试记录=${JSON.stringify(attempts)}；控件诊断=${JSON.stringify(diagnostics)}`);
+  throw new Error(`已通过拼多多“本地上传”按钮尝试首图，但未检测到轮播图上传结果。尝试记录=${JSON.stringify(attempts)}；控件诊断=${JSON.stringify(diagnostics)}`);
 }
 
 async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
