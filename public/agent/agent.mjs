@@ -653,16 +653,57 @@ async function pickCategory(page, context, pddTitle, cfg, step) {
 }
 
 async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
+  // 先按 URL 判断当前所处阶段，避免拿详情页/登录页去套类目页选择器。
+  const currentUrl = () => { try { return new URL(page.url()); } catch { return null; } };
+  let u = currentUrl();
+  if (u && isFormUrl(u.href)) {
+    await step(`拼多多当前已在商品详情页，跳过阶段 1：${u.pathname}`);
+    return page;
+  }
+  const isCategoryUrl = (url) => {
+    try {
+      const x = new URL(url);
+      return /(^|\\/)goods\\/category\\/?$/.test(x.pathname);
+    } catch { return false; }
+  };
+  if (!isCategoryUrl(page.url())) {
+    await step(`当前页面不是类目页（${page.url()}），重新打开类目入口`);
+    await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  }
   await step("拼多多阶段 1/2：首图、标题与自动类目", { stage: "拼多多：填写标题并识别类目" });
 
-  // 类目页先上传首图，再填写标题；标题失焦后由拼多多自动推荐/选择类目。
-  const title = page.locator('input[placeholder*="商品描述+规格"], input[placeholder*="最多输入30个汉字"]').first();
-  if (!(await title.isVisible().catch(() => false))) {
-    throw new Error("类目页未找到商品标题输入框；请确认当前位于 /goods/category");
+  // 标题输入框可能由页面异步渲染，也可能位于 iframe；优先按实际 placeholder 识别。
+  const titleSelectors = [
+    'input[placeholder*="商品描述+规格"]',
+    'input[placeholder*="最多输入30个汉字"]',
+    'input[placeholder*="商品标题"]',
+    'textarea[placeholder*="商品标题"]',
+    'input[aria-label*="商品标题"]'
+  ];
+  let title = null;
+  let titleFrame = null;
+  const deadlineForTitle = Date.now() + 15000;
+  while (Date.now() < deadlineForTitle && !title) {
+    for (const frame of page.frames()) {
+      for (const selector of titleSelectors) {
+        const candidate = frame.locator(selector).first();
+        if (await candidate.isVisible().catch(() => false)) {
+          title = candidate;
+          titleFrame = frame;
+          break;
+        }
+      }
+      if (title) break;
+    }
+    if (!title) await sleep(500);
+  }
+  if (!title) {
+    const frames = page.frames().map(f => f.url()).join(" | ");
+    throw new Error(`类目页标题框未找到；当前URL=${page.url()}；是否类目页=${isCategoryUrl(page.url())}；frames=${frames}`);
   }
   if (firstImage) {
-    const fileInput = page.locator('input[type="file"]').first();
-    if (!(await fileInput.count())) throw new Error("类目页未找到首图上传控件");
+    const fileInput = titleFrame.locator('input[type="file"]').first();
+    if (!(await fileInput.count())) throw new Error(`类目页未找到首图上传控件；当前URL=${page.url()}`);
     await fileInput.setInputFiles(firstImage);
     await sleep(1800);
     await step("  类目页首图已上传");
@@ -670,12 +711,12 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
     await step("⚠ 没有可用首图文件，跳过类目页首图上传");
   }
   await title.fill(pddTitle);
-  await title.press("Tab"); // 触发 blur，等待平台自动识别类目
+  await title.press("Tab");
   await sleep(2600);
 
   const next = page.getByText(/下一步[，, ]*完善商品信息/).first();
   if (!(await next.isVisible().catch(() => false))) {
-    throw new Error("类目页未出现“下一步，完善商品信息”；请检查首图/标题是否填写成功");
+    throw new Error(`类目页未出现“下一步，完善商品信息”；当前URL=${page.url()}；请检查首图/标题是否填写成功`);
   }
   await next.click({ timeout: 10000 });
   await step("  已点击下一步，等待商品详情页");
@@ -689,9 +730,8 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
     if (isFormUrl(page.url())) return page;
     await sleep(400);
   }
-  throw new Error("点击下一步后未进入商品详情页（goods_add）；请在浏览器确认类目并重试");
+  throw new Error(`点击下一步后未进入商品详情页（goods_add）；当前URL=${page.url()}`);
 }
-
 async function isPddLoginRequired(page) {
   let u;
   try { u = new URL(page.url()); } catch { return true; }
