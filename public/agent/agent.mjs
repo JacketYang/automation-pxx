@@ -772,6 +772,7 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
       throw new Error(`类目页没有可用于图片的上传控件；inputs=${JSON.stringify(inputInfo)}`);
     }
 
+    await armPddToastCapture(page);
     const beforeImages = await titleFrame.locator("img").count().catch(() => 0);
     let attached = false;
     let selectedIndex = -1;
