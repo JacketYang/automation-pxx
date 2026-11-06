@@ -7,6 +7,7 @@ export default function SetupGuide() {
       <li><a className="text-blue-600 underline" href="/agent/package.json" download>package.json</a></li>
       <li><a className="text-blue-600 underline" href="/agent/pricing.mjs" download>pricing.mjs</a></li>
       <li><a className="text-blue-600 underline" href="/agent/pricing.test.mjs" download>pricing.test.mjs</a></li>
+      <li><a className="text-blue-600 underline" href="/agent/login-agent.bat" download>login-agent.bat（首次双击登录）</a></li>
       <li><a className="text-blue-600 underline" href="/agent/start-agent.bat" download>start-agent.bat（以后双击启动）</a></li>
     </ul>
     <ol className="list-decimal space-y-2 pl-5">
