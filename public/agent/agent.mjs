@@ -688,21 +688,16 @@ async function fillSkuTable(page, pricing, specs) {
     if (!sku && list.length === 1) sku = list[0];
     if (!sku) sku = list[list.length - 1];                // 极端兜底：用最后一个定价，绝不留空
     const cells = row.locator("td,th");
-    // 已填过值的行跳过（避免反复覆盖、也尊重人工改动）；只补空白行
-    const existing = [];
-    for (const ci of [cStock, cGroup, cSingle]) {
-      if (ci < 0) continue;
-      const cur = await cells.nth(ci).locator('input:not([type=checkbox]):not([type=radio]):not([type=hidden])').first().inputValue().catch(() => "");
-      existing.push(String(cur || "").trim());
-    }
-    if (existing.some((v) => v !== "")) continue;
+    // 逐格判断：只补空白格，已填的格子跳过（尊重人工改动、不反复覆盖）
     for (const [ci, val] of [[cStock, sku.stock], [cGroup, sku.group], [cSingle, sku.single]]) {
       if (ci < 0) continue;
       const inp = cells.nth(ci).locator('input:not([type=checkbox]):not([type=radio]):not([type=hidden])').first();
-      if (await inp.count() && await inp.isVisible().catch(() => false)) {
-        await inp.fill(String(val)).catch(() => {});
-        filled++;
-      }
+      if (!(await inp.count())) continue;
+      if (!(await inp.isVisible().catch(() => false))) continue;
+      const cur = String(await inp.inputValue().catch(() => "")).trim();
+      if (cur !== "") continue; // 该格已有值，跳过
+      await inp.fill(String(val)).catch(() => {});
+      filled++;
     }
   }
   return filled;
@@ -736,18 +731,58 @@ async function fillSkuPreviewImages(page, files, step) {
   const rows = page.locator('[data-agent-skurow="1"]');
   const rc = await rows.count();
   let uploaded = 0;
-  for (let r = 0; r < rc; r++) {
-    const file = files[r % files.length];
-    const fi = rows.nth(r).locator("td,th").nth(cImg).locator('input[type=file]').first();
-    if (await fi.count()) {
-      await fi.setInputFiles(file).catch(() => {});
-      uploaded++;
-      await sleep(300);
+  // 多轮补齐：每轮把还没上传的行补一遍，最多 3 轮（行多时 filechooser 偶发失败）
+  for (let round = 0; round < 3; round++) {
+    let need = 0;
+    for (let r = 0; r < rc; r++) {
+      const file = files[r % files.length];
+      const cell = rows.nth(r).locator("td,th").nth(cImg);
+      const done = async () => cell.evaluate((el) => {
+        const hasWrapper = !!el.querySelector('[class*="materialContainer"], [class*="imageWrapper"]');
+        const hasImg = el.querySelectorAll("img").length > 0;
+        const hasUploadBtn = /本地上传/.test(el.innerText || "");
+        return hasImg || (hasWrapper && !hasUploadBtn);
+      }).catch(() => false);
+      if (await done()) continue;
+      need++;
+      // 滚动到该行，确保可点击
+      await cell.scrollIntoViewIfNeeded().catch(() => {});
+      await sleep(150);
+      let ok = false;
+      try {
+        const chooserP = page.waitForEvent("filechooser", { timeout: 8000 });
+        chooserP.catch(() => {});
+        const btn = cell.getByText(/^本地上传$/, { exact: true }).first();
+        if (await btn.count()) {
+          await btn.click({ force: true }).catch(() => {});
+          const chooser = await chooserP.catch(() => null);
+          if (chooser) { await chooser.setFiles(file); ok = true; }
+        }
+      } catch {}
+      if (!ok) {
+        const fi = cell.locator('input[type=file]').first();
+        if (await fi.count()) { await fi.setInputFiles(file).catch(() => {}); }
+      }
+      for (let w = 0; w < 10; w++) { await sleep(500); if (await done()) { uploaded++; break; } }
     }
+    if (!need) break;           // 全部完成
+    await sleep(1500);
   }
-  await sleep(1500);
-  await step(`  SKU 预览图：已为 ${uploaded}/${rc} 行上传`);
-  return uploaded;
+  await sleep(1000);
+  // 最终统计
+  let rendered = 0;
+  for (let r = 0; r < rc; r++) {
+    const cell = rows.nth(r).locator("td,th").nth(cImg);
+    const has = await cell.evaluate((el) => {
+      const hasWrapper = !!el.querySelector('[class*="materialContainer"], [class*="imageWrapper"]');
+      const hasImg = el.querySelectorAll("img").length > 0;
+      const hasUploadBtn = /本地上传/.test(el.innerText || "");
+      return hasImg || (hasWrapper && !hasUploadBtn);
+    }).catch(() => false);
+    if (has) rendered++;
+  }
+  await step(`  SKU 预览图：${rendered}/${rc} 行已上传`);
+  return rendered;
 }
 
 // 规格值一律用 1688 采集原文，不截短/不取【】内/不去重/不设数量上限。
@@ -1459,8 +1494,13 @@ async function auditPublishForm(page, cfg) {
         // 第2/3/4 列是 库存/拼单价/单买价
         const vals = [1, 2, 3].map((i) => { const inp = cells[i]?.querySelector("input"); return inp ? String(inp.value || "").trim() : ""; });
         if (vals.every((v) => v !== "" && Number(v) >= 0)) priceFilled++; else priceEmpty++;
-        // 预览图列（含 img 或 file input 已上传）
-        const imgCell = cells.find((c) => c.querySelector("img[src*='http'], img[src*='alicdn'], img[src^='data:']"));
+        // 预览图列：已上传判据 = 有 img 或已出现 imageWrapper 容器且不再显示"本地上传"
+        const imgCell = cells.find((c) => {
+          const hasImg = c.querySelector("img[src*='http'], img[src*='alicdn'], img[src^='data:']");
+          const wrapper = c.querySelector('[class*="materialContainer"], [class*="imageWrapper"]');
+          const stillUpload = /本地上传/.test(c.innerText || "");
+          return hasImg || (wrapper && !stillUpload);
+        });
         if (imgCell) skuImgCount++;
       }
       break;
@@ -1558,8 +1598,8 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   // 平台可能在规格录入被拒后异步补出空数据行；循环补填，确保每行都有价格库存（否则提交被拦）
   await attempt("价格库存表补填空行", async () => {
     let total = 0;
-    for (let round = 0; round < 4; round++) {
-      await sleep(600);
+    for (let round = 0; round < 8; round++) {
+      await sleep(800);
       const n = await fillSkuTable(page, pricing, specs);
       if (!n) break;
       total += n;
