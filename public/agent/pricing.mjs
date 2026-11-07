@@ -17,10 +17,16 @@ export function priceSku(cost, cfg, shippingCost = cfg.shippingCost) {
   const retainedRate = 1 - platformRate - afterSalesRate - adRate;
   if (retainedRate <= 0) throw new Error("平台费率 + 售后损耗 + 推广费率已达到或超过售价，无法实现正利润");
 
+  // 强制保底：最低利润与单买加价都不允许为负，任何参数组合都不得亏本。
+  const minProfit = Math.max(0, Number(cfg.minProfit));
+  const singleExtra = Math.max(0, Number(cfg.singleBuyExtra));
+
   const landedCost = Number(cost) + Number(shippingCost) + Number(cfg.fixedCost);
   const byMarkup = landedCost * (1 + cfg.markupPercent / 100);
-  const byProfit = (landedCost + cfg.minProfit) / retainedRate;
-  const group = Math.ceil(Math.max(byMarkup, byProfit) * 10 - 1e-9) / 10;
+  const byProfit = (landedCost + minProfit) / retainedRate;
+  // 售价硬下限：至少覆盖到岸成本 + 全部比例费用，保证利润 >= 0
+  const byBreakEven = landedCost / retainedRate;
+  const group = Math.ceil(Math.max(byMarkup, byProfit, byBreakEven) * 10 - 1e-9) / 10;
   const breakdown = (price) => {
     const platformFee = price * platformRate;
     const afterSalesCost = price * afterSalesRate;
@@ -33,7 +39,7 @@ export function priceSku(cost, cfg, shippingCost = cfg.shippingCost) {
       profit: roundMoney(profit),
     };
   };
-  const single = roundMoney(group + cfg.singleBuyExtra);
+  const single = roundMoney(group + singleExtra);
   const groupBreakdown = breakdown(group);
   const singleBreakdown = breakdown(single);
   return {

@@ -35,3 +35,12 @@ test("calculates single-buy profit separately", () => {
   const p = priceSku(7.14, cfg, 0);
   assert.ok(p.singleProfit > p.profit);
 });
+
+test("never sells below break-even even with hostile parameters", () => {
+  const bad = { ...cfg, minProfit: -50, singleBuyExtra: -20, markupPercent: -80 };
+  const p = priceSku(10, bad, 5);
+  assert.ok(p.profit >= 0, `拼单价利润不应为负: ${p.profit}`);
+  assert.ok(p.singleProfit >= 0, `单买价利润不应为负: ${p.singleProfit}`);
+  assert.ok(p.single >= p.group, "单买价不得低于拼单价");
+  assert.ok(p.group >= p.landedCost, "售价不得低于到岸成本");
+});

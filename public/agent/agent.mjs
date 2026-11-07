@@ -676,14 +676,22 @@ async function fillSkuTable(page, pricing, specs) {
   for (let r = 0; r < rc; r++) {
     const row = rows.nth(r);
     const name = (await row.locator("td,th").first().innerText().catch(() => "")).trim();
-    // 优先按规格名匹配（去掉我加的去重数字后缀），再退化为行序
-    const cleanName = name.replace(/\d+$/, "");
+    // 优先按规格名匹配，再按录入顺序对应；无论能否匹配，都必须给该行填上价，不能留空行
+    const cleanName = name.replace(/\s+/g, "");
     let sku = specs?.[r] ? list.find((s) => s.name === specs[r].original) : null;
-    if (!sku) sku = list.find((s) => String(s.name).includes(cleanName) || (cleanName && String(s.name).replace(/\s/g, "").includes(cleanName.replace(/\s/g, ""))));
-    if (!sku && rc === list.length) sku = list[r];
+    if (!sku) sku = list.find((s) => String(s.name).replace(/\s/g, "").includes(cleanName) || (cleanName && cleanName.includes(String(s.name).replace(/\s/g, ""))));
+    if (!sku && r < list.length) sku = list[r];          // 按录入行序兜底
     if (!sku && list.length === 1) sku = list[0];
-    if (!sku) continue;
+    if (!sku) sku = list[list.length - 1];                // 极端兜底：用最后一个定价，绝不留空
     const cells = row.locator("td,th");
+    // 已填过值的行跳过（避免反复覆盖、也尊重人工改动）；只补空白行
+    const existing = [];
+    for (const ci of [cStock, cGroup, cSingle]) {
+      if (ci < 0) continue;
+      const cur = await cells.nth(ci).locator('input:not([type=checkbox]):not([type=radio]):not([type=hidden])').first().inputValue().catch(() => "");
+      existing.push(String(cur || "").trim());
+    }
+    if (existing.some((v) => v !== "")) continue;
     for (const [ci, val] of [[cStock, sku.stock], [cGroup, sku.group], [cSingle, sku.single]]) {
       if (ci < 0) continue;
       const inp = cells.nth(ci).locator('input:not([type=checkbox]):not([type=radio]):not([type=hidden])').first();
@@ -738,26 +746,13 @@ async function fillSkuPreviewImages(page, files, step) {
   return uploaded;
 }
 
-// 拼多多单维度规格值上限（实测：颜色规格最多 16 个，再多页面不再新增 SKU 行）
-const PDD_SPEC_MAX = 16;
-
-// 把 1688 的规格值规范化成拼多多可填的短名：取【】内核心，去空格，截到 18 字，并去重
+// 规格值一律用 1688 采集原文，不截短/不取【】内/不去重/不设数量上限。
+// 平台若对长度或数量有限制，由平台自己截断或拒绝；助手不擅自改商品信息。
 function normalizeSpecValues(rawValues) {
-  const seen = new Set();
-  const out = [];
-  for (let i = 0; i < rawValues.length && out.length < PDD_SPEC_MAX; i++) {
-    const raw = String(rawValues[i] ?? "");
-    const m = raw.match(/【([^】]+)】/);
-    let s = (m ? m[1] : raw).replace(/\s+/g, "").slice(0, 18);
-    if (!s) continue;
-    // 去重：同名加短后缀，避免页面"规格值重复"错误
-    let base = s, n = 1;
-    while (seen.has(s) && n < 100) { s = base.slice(0, 15) + n; n++; }
-    if (seen.has(s)) continue;
-    seen.add(s);
-    out.push({ label: s, original: raw });
-  }
-  return out;
+  return rawValues
+    .map((v) => String(v ?? "").trim())
+    .filter(Boolean)
+    .map((original) => ({ label: original, original }));
 }
 
 // 拼多多颜色规格录入（真实页面控件：input[placeholder="选择或输入主色"] + 备注框回车）
@@ -774,8 +769,7 @@ async function addSpecs(page, product, step) {
     await sleep(400);
   }
   if (!ready) {
-    // 非颜色规格：回退到旧的通用规格值输入框
-    await step("  ⚠ 未发现颜色规格控件，尝试通用规格输入框");
+    await step("  ⚠ 未发现颜色规格控件，保留页面供人工填写规格");
     return [];
   }
 
@@ -803,27 +797,119 @@ async function addSpecs(page, product, step) {
     }
     if (ok) added++;
     else {
-      await step(`  ⚠ 规格「${spec.label}」页面未生成 SKU 行（可能已达 ${PDD_SPEC_MAX} 个上限），停止录入`);
+      await step(`  ⚠ 规格「${spec.label}」页面未生成 SKU 行（可能触发平台长度/数量/重复限制），停止录入，保留已填内容`);
       break;
     }
   }
-  await step(`  规格录入完成：${product.dims[0].name}；已生成 ${added} 个 SKU 行${specs.length > added ? `（源 ${specs.length} 个，取前 ${added} 个）` : ""}`);
+  await step(`  规格录入完成：${product.dims[0].name}；采集 ${specs.length} 个，页面已生成 ${added} 个 SKU 行`);
   await sleep(800);
   // 返回实际生效的规格（供价格表按行序匹配 original）
   return specs.slice(0, added);
 }
 
-// 商品属性：点击页面「一键复用」自动填入相似品属性（平台推荐，合规且最省事）。
-async function applyReuseAttrs(page, step) {
-  const btn = page.getByText("一键复用", { exact: true }).first();
-  if (!(await btn.isVisible().catch(() => false))) {
-    await step("  商品属性：无「一键复用」推荐，保留页面默认");
-    return false;
+// 商品属性：按 1688 采集到的 product.attrs 逐项映射到页面属性控件。
+// 绝不点「一键复用」（那是平台推荐值，不是采集值）；能匹配就选，匹配不到就留空并记日志，不瞎猜。
+// 1688 属性名 → 拼多多类目属性名（同类目下语义相近的映射）
+const ATTR_NAME_MAP = {
+  "包装方式": ["包装方式"],
+  "线幅": ["书写粗细"],
+  "笔头": ["重要笔头", "笔头"],
+  "用途": ["适用场景"],
+  "适用类型": ["重要适用类型"],
+  "材质": ["材质", "重要材质"],
+  "风格": ["风格"],
+  "是否可擦": ["是否可擦"],
+  "适用年龄段": ["适用年龄段"],
+  "特点": ["特点"],
+};
+
+async function applyAttrsFromProduct(page, product, step) {
+  const attrs = product.attrs || {};
+  if (!Object.keys(attrs).length) {
+    await step("  商品属性：采集数据里没有属性，保留页面为空（不一键复用、不瞎填）");
+    return 0;
   }
-  await btn.click().catch(() => {});
-  await sleep(1000);
-  await step("  商品属性：已一键复用平台推荐属性");
-  return true;
+  // 配对：遍历所有文本节点式属性名，按 DOM 顺序找"紧随其后最近的可见 select/搜索 input"，
+  // 给该 input 打标记，返回 {属性名, 标记序号, 当前值}。
+  const fields = await page.evaluate(() => {
+    const vis = (e) => { try { return e.getClientRects().length > 0; } catch { return false; } };
+    const txt = (e) => (e.innerText || e.textContent || "").trim();
+    const names = ["品牌", "重要适用类型", "重要笔头", "书写粗细", "风格", "是否可擦", "特点", "适用场景", "包装方式", "适用年龄段", "材质", "线幅", "用途", "货号", "型号", "是否进口"];
+    const all = [...document.querySelectorAll("*")];
+    const out = [];
+    let tag = 0;
+    for (const nm of names) {
+      const el = all.find((e) => vis(e) && txt(e) === nm && e.children.length <= 2);
+      if (!el) continue;
+      // 找 el 之后最近的可见 select/搜索 input（用 compareDocumentPosition）
+      const inputs = [...document.querySelectorAll('input[placeholder="请选择"],input[placeholder="请输入品牌名称搜索"]')].filter(vis);
+      let best = null;
+      for (const inp of inputs) {
+        if ((el.compareDocumentPosition(inp) & Node.DOCUMENT_POSITION_FOLLOWING) && !inp.hasAttribute("data-agent-attr")) { best = inp; break; }
+      }
+      if (!best) continue;
+      best.setAttribute("data-agent-attr", String(tag));
+      out.push({ name: nm, tag, val: best.value || "" });
+      tag++;
+    }
+    return out;
+  });
+
+  let filled = 0;
+  const skipped = [];
+  for (const f of fields) {
+    // 找采集属性值：同名优先，其次走映射表
+    let value = attrs[f.name];
+    if (!value) {
+      for (const [src, targets] of Object.entries(ATTR_NAME_MAP)) {
+        if (targets.includes(f.name) && attrs[src]) { value = attrs[src]; break; }
+      }
+    }
+    if (!value) { skipped.push(`${f.name}(无采集值)`); continue; }
+    value = String(value).trim();
+    if (!value || value.length > 30) { skipped.push(`${f.name}(值过长/空)`); continue; }
+
+    const ctrl = page.locator(`[data-agent-attr="${f.tag}"]`);
+    if (!(await ctrl.count())) { skipped.push(`${f.name}(控件丢失)`); continue; }
+
+    // 品牌：采集品牌无授权，按既有评估填"无品牌"（不冒充品牌）
+    if (f.name === "品牌") {
+      await ctrl.fill("无品牌").catch(() => {});
+      await sleep(500);
+      const opt = page.getByText(/无品牌|其他/, { exact: false }).first();
+      if (await opt.isVisible().catch(() => false)) await opt.click().catch(() => {});
+      await sleep(300);
+      filled++;
+      await step(`  商品属性「品牌」：采集值「${value}」无授权，按规则填「无品牌」`);
+      continue;
+    }
+
+    // 通用下拉：点开 → 在可见选项里找含采集值的项 → 点击；找不到不强行输入，留空记录
+    await ctrl.click({ force: true }).catch(() => {});
+    await sleep(500);
+    const opts = await page.evaluate((v) => {
+      const vis = (e) => { try { return e.getClientRects().length > 0; } catch { return false; } };
+      const tx = (e) => (e.innerText || e.textContent || "").trim();
+      return [...document.querySelectorAll("li,[class*=option],[class*=Option],[role=option]")]
+        .filter(vis).map(tx).filter((t) => t && t.length < 40 && (t.includes(v) || v.includes(t))).slice(0, 5);
+    }, value).catch(() => []);
+    let picked = false;
+    for (const o of opts) {
+      const el = page.getByText(o, { exact: true }).first();
+      if (await el.isVisible().catch(() => false)) { await el.click().catch(() => {}); picked = true; break; }
+    }
+    if (picked) { filled++; await step(`  商品属性「${f.name}」← 采集值「${value}」`); }
+    else { skipped.push(`${f.name}(下拉无「${value}」选项，留空待人工)`); }
+    await page.keyboard.press("Escape").catch(() => {});
+    await sleep(200);
+  }
+  await step(`  商品属性：按采集信息填 ${filled} 项${skipped.length ? `；未填：${skipped.join("、")}` : ""}（未使用一键复用）`);
+  return filled;
+}
+
+// 兼容旧调用名（保留导出语义）
+async function applyReuseAttrs(page, product, step) {
+  return applyAttrsFromProduct(page, product, step);
 }
 
 // 服务与承诺：页面默认已勾选 48小时发货 / 7天无理由 / 非二手 等，
@@ -1176,21 +1262,39 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
   await title.press("Tab");
   await sleep(2600);
 
+  // 有些商品平台不自动推荐类目（"暂无推荐的分类，点击手动选择分类"），
+  // 不先选类目就点"下一步"会被静默拦截。这里显式处理。
+  const needManualCategory = await page.getByText(/暂无推荐的分类|手动选择分类|选择分类/).first().isVisible().catch(() => false);
+  if (needManualCategory) {
+    await step("  平台未自动推荐类目，走手动选择分类");
+    await pickCategory(page, context, pddTitle, cfg, step).catch((e) => step(`  手动选类目未成功：${e.message}`));
+  }
+
   const next = page.getByText(/下一步[，, ]*完善商品信息/).first();
   if (!(await next.isVisible().catch(() => false))) {
     throw new Error(`类目页未出现“下一步，完善商品信息”；当前URL=${page.url()}；请检查首图/标题是否填写成功`);
   }
-  await next.click({ timeout: 10000 });
-  await step("  已点击下一步，等待商品详情页");
+  // 点下一步可能被平台异步校验拦截，重试最多 3 次，每次等 3 秒看是否进入详情页
   const deadline = Date.now() + 20000;
-  while (Date.now() < deadline) {
-    const form = context.pages().find((p) => isFormUrl(p.url()));
-    if (form) {
-      await form.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => {});
-      return form;
+  for (let attempt = 0; attempt < 3 && Date.now() < deadline; attempt++) {
+    await next.click({ timeout: 10000 }).catch(() => {});
+    if (attempt === 0) await step("  已点击下一步，等待商品详情页");
+    const waitUntil = Date.now() + 4000;
+    while (Date.now() < waitUntil) {
+      const form = context.pages().find((p) => isFormUrl(p.url()));
+      if (form) {
+        await form.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => {});
+        return form;
+      }
+      if (isFormUrl(page.url())) return page;
+      await sleep(400);
     }
-    if (isFormUrl(page.url())) return page;
-    await sleep(400);
+    // 仍未跳转：若出现手动选类目提示，补一次
+    const manual = await page.getByText(/暂无推荐的分类|选择分类/).first().isVisible().catch(() => false);
+    if (manual) {
+      await step("  下一步被拦截：检测到需手动选择分类");
+      await pickCategory(page, context, pddTitle, cfg, step).catch(() => {});
+    }
   }
   throw new Error(`点击下一步后未进入商品详情页（goods_add）；当前URL=${page.url()}`);
 }
@@ -1302,8 +1406,8 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   for (const f of files.detail) if (gal.length < 3 && !gal.includes(f)) gal.push(f);
   const okImg = await attempt("商品轮播图", () => uploadByLabel(page, /商品轮播图|轮播图|商品主图/, gal.slice(0, 10), step));
   await attempt("商品详情图", () => uploadByLabel(page, /商品详情|商品详情图|图文详情|详情图/, (files.detail.length ? files.detail : files.gallery).slice(0, 20), step));
-  // 商品属性（平台推荐一键复用）
-  await attempt("商品属性", () => applyReuseAttrs(page, step));
+  // 商品属性（严格按采集到的 product.attrs 填，不用一键复用）
+  await attempt("商品属性", () => applyAttrsFromProduct(page, product, step));
   // 规格录入（颜色控件），返回实际生效的规格供价格表匹配
   let specs = [];
   await attempt("商品规格", async () => { specs = await addSpecs(page, product, step); });
@@ -1314,6 +1418,17 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   });
   // SKU 预览图：拼多多强制每行都要有，否则提交被拦
   await attempt("SKU 预览图", () => fillSkuPreviewImages(page, files.skuImages, step));
+  // 平台可能在规格录入被拒后异步补出空数据行；循环补填，确保每行都有价格库存（否则提交被拦）
+  await attempt("价格库存表补填空行", async () => {
+    let total = 0;
+    for (let round = 0; round < 4; round++) {
+      await sleep(600);
+      const n = await fillSkuTable(page, pricing, specs);
+      if (!n) break;
+      total += n;
+    }
+    if (!total) throw new Error("没有可补填的价格库存行");
+  });
   if (!priced && pricing.skus.length === 1) {
     const s = pricing.skus[0];
     const a = await fillByLabel(page, /拼单价/, s.group).then(() => true).catch(() => false);
@@ -1402,12 +1517,12 @@ async function runJob({ context, job, cfg, step, mode }) {
     }
     await step("判断结果：可以上架，开始准备素材", { ...base, stage: "下载图片" });
 
-    // SKU 预览图：按规格值顺序取对应图，保证与价格表行一一对应；最多 16 张（拼多多规格上限）
-    const dimValues = (product.dims?.[0]?.values || []).slice(0, PDD_SPEC_MAX);
+    // SKU 预览图：按规格值顺序取对应图，保证与价格表行一一对应；不预设数量上限
+    const dimValues = product.dims?.[0]?.values || [];
     const skuImgs = dimValues.map((v) => product.skus.find((s) => s.name === v)?.image).filter(Boolean);
     const files = {
       gallery: await downloadImages(product.gallery, path.join(outDir, "gallery"), "g", step),
-      skuImages: await downloadImages(skuImgs.slice(0, PDD_SPEC_MAX), path.join(outDir, "sku"), "s", step),
+      skuImages: await downloadImages(skuImgs, path.join(outDir, "sku"), "s", step),
       detail: await downloadImages(product.detailImages, path.join(outDir, "detail"), "d", step),
     };
     await step(`图片：主图 ${files.gallery.length}，详情图 ${files.detail.length}，SKU 图 ${files.skuImages.length}`);
@@ -1561,13 +1676,45 @@ async function main() {
         }
         const current = loadLocalConfig();
         const next = { ...current, minProfit: round2(minProfit), targetRoi: round2(targetRoi) };
+        // 单件运费：允许在工作台修改，直接影响定价的到岸成本（priceSku 的 shippingCost 参数）
+        if (body.shippingCost !== undefined) {
+          const sc = Number(body.shippingCost);
+          if (!Number.isFinite(sc) || sc < 0 || sc > 1000) {
+            res.writeHead(400); res.end(JSON.stringify({ error: "单件运费需为 0–1000 元" })); return;
+          }
+          next.shippingCost = round2(sc);
+        }
         if (typeof body.shippingTemplate === "string") next.shippingTemplate = body.shippingTemplate.trim();
         if (body.promiseHours !== undefined) {
           const h = Number(body.promiseHours);
           if ([24, 48].includes(h)) next.promiseHours = h;
         }
-        fs.writeFileSync(LOCAL_CONFIG_PATH, JSON.stringify(next, null, 2), "utf8");
-        res.writeHead(200); res.end(JSON.stringify({ minProfit: next.minProfit, targetRoi: next.targetRoi, shippingTemplate: next.shippingTemplate, promiseHours: next.promiseHours })); return;
+        // 明确以 UTF-8 写入，避免中文违禁词/品牌词在不同代码页环境下被写坏
+        fs.writeFileSync(LOCAL_CONFIG_PATH, JSON.stringify(next, null, 2), { encoding: "utf8" });
+        res.writeHead(200); res.end(JSON.stringify({ minProfit: next.minProfit, targetRoi: next.targetRoi, shippingCost: next.shippingCost, shippingTemplate: next.shippingTemplate, promiseHours: next.promiseHours })); return;
+      }
+      // 保存当前发布页为草稿（供人工在草稿箱核对，不提交上架）
+      if (req.method === "POST" && req.url === "/save-draft") {
+        try {
+          const { context: c } = await openBrowser();
+          const page = c.pages().find((p) => /goods_add/.test(p.url()));
+          if (!page) { res.writeHead(404); res.end(JSON.stringify({ error: "没有打开的商品发布页" })); return; }
+          await page.bringToFront();
+          const clicked = await page.getByText(/^保存草稿$/).first().click({ timeout: 5000 }).then(() => true).catch(() => false);
+          if (!clicked) { res.writeHead(500); res.end(JSON.stringify({ error: "没找到「保存草稿」按钮" })); return; }
+          await sleep(2000);
+          const body = await page.locator("body").innerText().catch(() => "");
+          const ok = /保存成功|草稿|保存草稿成功/.test(body);
+          res.writeHead(200); res.end(JSON.stringify({ ok, msg: ok ? "已保存草稿" : "已点击保存草稿，请到草稿箱确认" })); return;
+        } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); return; }
+      }
+      // 清空历史任务记录（不动运行中的），便于串行地试下一个链接
+      if (req.method === "POST" && req.url === "/jobs/clear") {
+        const before = jobs.length;
+        for (let i = jobs.length - 1; i >= 0; i--) {
+          if (jobs[i].status !== "running" && jobs[i].status !== "queued") jobs.splice(i, 1);
+        }
+        res.writeHead(200); res.end(JSON.stringify({ cleared: before - jobs.length })); return;
       }
       if (req.method === "POST" && req.url === "/jobs") {
         let raw = "";
@@ -1578,6 +1725,10 @@ async function main() {
         const lines = String(body.urls || "").split(/[\s,，;；]+/).map(x => x.trim()).filter(Boolean);
         const ids = [...new Set(lines.map(parseOfferId).filter(Boolean))];
         if (!ids.length) { res.writeHead(400); res.end(JSON.stringify({ error: "没有识别到有效的 1688 商品链接" })); return; }
+        // 浏览器是单例，任务必须串行：有运行中或已停在提交前的任务时，拒绝新任务，避免抢页面
+        if (jobs.some((j) => j.status === "running" || j.status === "queued" || (j.status === "filled" && mode !== "check"))) {
+          res.writeHead(409); res.end(JSON.stringify({ error: "已有任务正在处理或停在提交前，请先处理完再提交（浏览器单例，任务需串行）" })); return;
+        }
         const created = ids.map(offerId => {
           const job = { id: nextId++, offerId, sourceUrl: `https://detail.1688.com/offer/${offerId}.html`, mode, status: "queued", stage: "排队中", logs: [], createdAt: new Date().toISOString() };
           jobs.push(job); return job;
