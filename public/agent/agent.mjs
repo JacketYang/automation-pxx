@@ -1320,56 +1320,38 @@ async function isPddLoginRequired(page) {
   return false;
 }
 
-// ── 登录态检测（供 /health 与前端展示）──
-// 依据真实证据：常驻浏览器里存在"已登录的拼多多业务页"即判已登录。
-// 【硬规则】登录检测绝不新建页面：只读已存在的标签；没有可用证据就判 need_login。
-// 旧逻辑在掉登录后会 context.newPage() 探测，而 /health 每 1.5s 被轮询，
-// 导致疯狂新建窗口并重定向到登录页 —— 已废弃。
-let loginStatus = { pdd: "unknown", pdd1688: "unknown", checkedAt: 0 };
-const LOGIN_TTL = 1500;
+// ── 登录态（重写：一个信号、一个布尔、三个检测时机）──
+// 唯一信号：常驻浏览器里 mms.pinduoduo.com 的登录会话 cookie（JSESSIONID）。
+//   实测已登录时存在、未登录时不存在；读 cookie 是同步本地操作，零请求、零新页面。
+// 检测时机仅 3 个：agent 启动 / 用户点「重新检测」(POST /check-login) / 每个任务开始前。
+//   /health 只读缓存布尔，绝不触发检测（旧版把检测绑在 1.5s 轮询上 + newPage 探测，已彻底废弃）。
+let pddLoggedIn = false;          // 唯一状态
+let loginCheckedAt = 0;           // 仅用于前端展示"上次检测时间"
 
-// 全局登录熔断：一旦判定掉登录，任何任务/浏览器操作都拒绝，直到用户重新登录并点「重新检测」。
-let pddLoggedOut = false;
-
-async function refreshLoginStatus(context) {
-  const result = { pdd: "unknown", pdd1688: "unknown", checkedAt: Date.now() };
+// 唯一检测函数：只读 cookie，绝不 newPage、绝不 goto、绝不读页面文本。
+async function checkLoginNow(context) {
+  let ok = false;
   try {
-    const ck = await context.cookies("https://www.1688.com").catch(() => []);
-    result.pdd1688 = ck.some((c) => c.name === "__cn_logon__" && c.value === "true") ? "logged_in" : "unknown";
-  } catch {}
-  try {
-    // 存在登录页 = 明确掉登录（优先判定，避免误判成 unknown 而继续操作）
-    const pages = context.pages();
-    const hasLoginPage = pages.some((p) => { try { return /(login|passport)/.test(new URL(p.url()).pathname); } catch { return false; } });
-    const bizPages = pages.filter((p) => {
-      try { const u = new URL(p.url()); return u.hostname === "mms.pinduoduo.com" && !/(^|\/)(login|passport)/.test(u.pathname); }
-      catch { return false; }
-    });
-    let proven = false;
-    for (const p of bizPages) {
-      const body = await p.locator("body").innerText({ timeout: 1500 }).catch(() => "");
-      if (/退出当前账号|登录其他账号需先退出/.test(body) || /提交并上架|运费模板|商品列表|发布新商品/.test(body)) {
-        proven = true; break;
-      }
-    }
-    if (hasLoginPage && !proven) result.pdd = "need_login";
-    else if (proven) result.pdd = "logged_in";
-    else result.pdd = "need_login"; // 无任何页面证据，一律按未登录处理，绝不开新页
-  } catch { result.pdd = "need_login"; }
-  pddLoggedOut = result.pdd !== "logged_in";
-  loginStatus = result;
-  return result;
+    const cookies = await context.cookies();
+    ok = cookies.some((c) =>
+      /pinduoduo\.com|yangeduo\.com/.test(c.domain) &&
+      c.name === "JSESSIONID" && String(c.value || "").length > 0
+    );
+  } catch { ok = false; }
+  pddLoggedIn = ok;
+  loginCheckedAt = Date.now();
+  return ok;
 }
 
-async function getLoginStatus(context) {
-  if (context && Date.now() - loginStatus.checkedAt > LOGIN_TTL) await refreshLoginStatus(context);
-  return loginStatus;
+// /health 用：只读缓存，不检测
+function loginSnapshot() {
+  return { pdd: pddLoggedIn ? "logged_in" : "need_login", pdd1688: "unknown", checkedAt: loginCheckedAt };
 }
 
-// 任何会操作浏览器的动作前调用：掉登录直接抛错熔断，不再新建页面
+// 任何会操作浏览器的动作前调用：未登录直接熔断
 function assertLoggedIn() {
-  if (pddLoggedOut || loginStatus.pdd !== "logged_in")
-    throw new Error("拼多多登录已失效，已熔断：请先在常驻浏览器重新登录并点「重新检测」，恢复后再继续。期间不会新建任何页面或执行任务。");
+  if (!pddLoggedIn)
+    throw new Error("拼多多未登录，已熔断：请在常驻浏览器登录并点工作台「重新检测」，恢复后再继续。期间不会新建任何页面或执行任务。");
 }
 
 async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, mode, step }) {
@@ -1643,13 +1625,13 @@ async function main() {
       if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       if (req.method === "GET" && req.url === "/health") {
-        const login = await getLoginStatus(context);
-        res.writeHead(200); res.end(JSON.stringify({ online: true, version: "1.1.0", host: process.env.COMPUTERNAME || "本机", active, port: PORT, login })); return;
+        // 只读缓存布尔，绝不在这里触发检测（检测只在 启动 / 重新检测 / 任务前）
+        res.writeHead(200); res.end(JSON.stringify({ online: true, version: "1.1.0", host: process.env.COMPUTERNAME || "本机", active, port: PORT, login: loginSnapshot() })); return;
       }
-      // 主动刷新登录检测（前端「重新检测」按钮）
+      // 用户点「重新检测」：唯一的用户主动检测入口
       if (req.method === "POST" && req.url === "/check-login") {
-        const s = context ? await refreshLoginStatus(context) : loginStatus;
-        res.writeHead(200); res.end(JSON.stringify({ login: s })); return;
+        if (context) await checkLoginNow(context);
+        res.writeHead(200); res.end(JSON.stringify({ login: loginSnapshot() })); return;
       }
       // 在常驻浏览器里打开两个登录页（复用同一窗口的新标签，不新开浏览器）
       if (req.method === "POST" && req.url === "/login") {
@@ -1673,7 +1655,7 @@ async function main() {
         try {
           const { context: c } = await openBrowser();
           const page = c.pages().find((p) => p.url().includes("carriage/list"));
-          if (page && !pddLoggedOut) templates = await readTemplatesFromPage(page);
+          if (page && pddLoggedIn) templates = await readTemplatesFromPage(page);
         } catch {}
         res.writeHead(200); res.end(JSON.stringify({ templates })); return;
       }
@@ -1763,8 +1745,8 @@ async function main() {
         const ids = [...new Set(lines.map(parseOfferId).filter(Boolean))];
         if (!ids.length) { res.writeHead(400); res.end(JSON.stringify({ error: "没有识别到有效的 1688 商品链接" })); return; }
         // 掉登录熔断：拒绝新任务，避免掉登录后继续开页面/重定向刷屏
-        if (pddLoggedOut || loginStatus.pdd !== "logged_in") {
-          res.writeHead(503); res.end(JSON.stringify({ error: "拼多多登录已失效，已暂停全部任务。请先重新登录并点「重新检测」。" })); return;
+        if (!pddLoggedIn) {
+          res.writeHead(503); res.end(JSON.stringify({ error: "拼多多未登录，已暂停全部任务。请先登录并点「重新检测」。" })); return;
         }
         // 浏览器是单例，任务必须串行：有运行中或已停在提交前的任务时，拒绝新任务，避免抢页面
         if (jobs.some((j) => j.status === "running" || j.status === "queued" || (j.status === "filled" && mode !== "check"))) {
@@ -1785,17 +1767,18 @@ async function main() {
         const opened = await openBrowser();
         context = opened.context;
         console.log(`✔ 常驻浏览器已就绪（调试端口 ${CDP_PORT}，登录态会一直保留，请勿关闭该 Chrome 窗口）`);
-        const s0 = await refreshLoginStatus(context);
-        console.log(s0.pdd === "logged_in" ? "✔ 拼多多登录态有效，可直接开始处理任务。" :
-          "⚠ 拼多多尚未登录，请在浏览器完成登录（或点网页右上角「去登录」）。登录后点「重新检测」，任务执行前也会自动检测。");
+        // 检测时机 1/3：agent 启动
+        const ok0 = await checkLoginNow(context);
+        console.log(ok0 ? "✔ 拼多多已登录，可处理任务。" :
+          "⚠ 拼多多未登录，请在浏览器登录后点工作台「重新检测」。");
         while (true) {
           const job = jobs.find(x => x.status === "queued");
           if (!job) { await sleep(700); continue; }
-          // 每个任务执行前刷新登录态；掉了就地熔断，该任务标记失败并停止后续处理
-          await refreshLoginStatus(context).catch(() => {});
-          if (pddLoggedOut) {
-            job.status = "failed"; job.stage = "已暂停：拼多多登录失效";
-            job.logs.push({ t: new Date().toISOString(), m: "拼多多登录已失效，任务熔断。请先重新登录并点「重新检测」，期间不会新建任何页面。" });
+          // 检测时机 3/3：每个任务开始前（/health 不检测）
+          await checkLoginNow(context).catch(() => {});
+          if (!pddLoggedIn) {
+            job.status = "failed"; job.stage = "已暂停：拼多多未登录";
+            job.logs.push({ t: new Date().toISOString(), m: "拼多多未登录，任务熔断。请登录并点「重新检测」，期间不会新建任何页面。" });
             job.updatedAt = new Date().toISOString();
             active = false;
             await sleep(2000);
@@ -1806,7 +1789,6 @@ async function main() {
           job.stage = "开始处理";
           const step = makeStep(job);
           await runJob({ context, job, cfg: loadLocalConfig(), step, mode: job.mode });
-          await refreshLoginStatus(context).catch(() => {});
           if (job.status === "running") { job.status = "failed"; job.stage = "任务结束但未返回结果"; }
           job.updatedAt = new Date().toISOString();
           active = false;
