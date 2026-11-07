@@ -952,21 +952,13 @@ async function applyShippingTemplate(page, name, step) {
   return false;
 }
 
-// 拉取店铺当前运费模板列表：复用运费模板页（carriage/list）已打开的标签，
-// 没打开就临时开一个读取再关。返回名称数组。
+// 读取店铺运费模板列表：只读已打开的 carriage/list 标签，绝不新建页面。
 const CARRIAGE_URL = "https://mms.pinduoduo.com/orders/order/carriage/list";
-async function fetchShippingTemplates(context) {
-  let page = context.pages().find((p) => p.url().includes("carriage/list"));
-  let temp = false;
-  if (!page) { page = await context.newPage(); temp = true; }
+async function readTemplatesFromPage(page) {
   try {
-    if (!page.url().includes("carriage/list")) {
-      await page.goto(CARRIAGE_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-      await sleep(2500);
-    }
+    if (!page || page.url().includes("/login/")) return [];
     const names = await page.evaluate(() => {
       const out = [];
-      // 模板名出现在表格首列链接/单元格
       for (const tr of document.querySelectorAll("tr")) {
         const c = tr.querySelector("td");
         if (!c) continue;
@@ -977,7 +969,11 @@ async function fetchShippingTemplates(context) {
     });
     return names;
   } catch { return []; }
-  finally { if (temp) await page.close().catch(() => {}); }
+}
+// 兼容旧调用：只复用已有标签，没有就返回空（绝不 newPage）
+async function fetchShippingTemplates(context) {
+  const page = context.pages().find((p) => p.url().includes("carriage/list"));
+  return page ? await readTemplatesFromPage(page) : [];
 }
 
 async function pickCategory(page, context, pddTitle, cfg, step) {
@@ -1208,6 +1204,7 @@ async function uploadCategoryCover(page, imagePath, step) {
 }
 
 async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
+  const cfg = loadLocalConfig();
   // 先按 URL 判断当前所处阶段，避免拿详情页/登录页去套类目页选择器。
   const currentUrl = () => { try { return new URL(page.url()); } catch { return null; } };
   let u = currentUrl();
@@ -1257,7 +1254,14 @@ async function prepareCategoryPage(page, context, pddTitle, firstImage, step) {
     const frames = page.frames().map(f => f.url()).join(" | ");
     throw new Error(`类目页标题框未找到；当前URL=${page.url()}；是否类目页=${isCategoryUrl(page.url())}；frames=${frames}`);
   }
-  await uploadCategoryCover(page, firstImage, step);
+  // 首图上传偶发失败（选了文件但轮播区计数没变），重试 3 次
+  let coverOk = false;
+  let lastCoverErr = "";
+  for (let i = 0; i < 3 && !coverOk; i++) {
+    try { await uploadCategoryCover(page, firstImage, step); coverOk = true; }
+    catch (e) { lastCoverErr = e.message; if (i < 2) { await step(`  首图上传第 ${i + 1} 次未成功，重试…`); await sleep(1500); } }
+  }
+  if (!coverOk) throw new Error(`首图上传重试 3 次仍失败：${lastCoverErr.slice(0, 200)}`);
   await title.fill(pddTitle);
   await title.press("Tab");
   await sleep(2600);
@@ -1318,9 +1322,14 @@ async function isPddLoginRequired(page) {
 
 // ── 登录态检测（供 /health 与前端展示）──
 // 依据真实证据：常驻浏览器里存在"已登录的拼多多业务页"即判已登录。
-// 不再让一次缓存结果长期不刷新（旧逻辑：启动未登录 -> 后来登录后仍显示未登录）。
+// 【硬规则】登录检测绝不新建页面：只读已存在的标签；没有可用证据就判 need_login。
+// 旧逻辑在掉登录后会 context.newPage() 探测，而 /health 每 1.5s 被轮询，
+// 导致疯狂新建窗口并重定向到登录页 —— 已废弃。
 let loginStatus = { pdd: "unknown", pdd1688: "unknown", checkedAt: 0 };
-const LOGIN_TTL = 1500; // ms；/health 轮询会自动刷新，登录后最多 1.5s 变绿
+const LOGIN_TTL = 1500;
+
+// 全局登录熔断：一旦判定掉登录，任何任务/浏览器操作都拒绝，直到用户重新登录并点「重新检测」。
+let pddLoggedOut = false;
 
 async function refreshLoginStatus(context) {
   const result = { pdd: "unknown", pdd1688: "unknown", checkedAt: Date.now() };
@@ -1329,7 +1338,10 @@ async function refreshLoginStatus(context) {
     result.pdd1688 = ck.some((c) => c.name === "__cn_logon__" && c.value === "true") ? "logged_in" : "unknown";
   } catch {}
   try {
-    const bizPages = context.pages().filter((p) => {
+    // 存在登录页 = 明确掉登录（优先判定，避免误判成 unknown 而继续操作）
+    const pages = context.pages();
+    const hasLoginPage = pages.some((p) => { try { return /(login|passport)/.test(new URL(p.url()).pathname); } catch { return false; } });
+    const bizPages = pages.filter((p) => {
       try { const u = new URL(p.url()); return u.hostname === "mms.pinduoduo.com" && !/(^|\/)(login|passport)/.test(u.pathname); }
       catch { return false; }
     });
@@ -1340,16 +1352,11 @@ async function refreshLoginStatus(context) {
         proven = true; break;
       }
     }
-    if (proven) result.pdd = "logged_in";
-    else {
-      const page = await context.newPage();
-      try {
-        await page.goto(PDD_CATEGORY_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
-        await sleep(1200);
-        result.pdd = (await isPddLoginRequired(page)) ? "need_login" : "logged_in";
-      } finally { await page.close().catch(() => {}); }
-    }
-  } catch { result.pdd = "unknown"; }
+    if (hasLoginPage && !proven) result.pdd = "need_login";
+    else if (proven) result.pdd = "logged_in";
+    else result.pdd = "need_login"; // 无任何页面证据，一律按未登录处理，绝不开新页
+  } catch { result.pdd = "need_login"; }
+  pddLoggedOut = result.pdd !== "logged_in";
   loginStatus = result;
   return result;
 }
@@ -1357,6 +1364,12 @@ async function refreshLoginStatus(context) {
 async function getLoginStatus(context) {
   if (context && Date.now() - loginStatus.checkedAt > LOGIN_TTL) await refreshLoginStatus(context);
   return loginStatus;
+}
+
+// 任何会操作浏览器的动作前调用：掉登录直接抛错熔断，不再新建页面
+function assertLoggedIn() {
+  if (pddLoggedOut || loginStatus.pdd !== "logged_in")
+    throw new Error("拼多多登录已失效，已熔断：请先在常驻浏览器重新登录并点「重新检测」，恢复后再继续。期间不会新建任何页面或执行任务。");
 }
 
 async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, mode, step }) {
@@ -1654,9 +1667,14 @@ async function main() {
       if (req.method === "GET" && req.url === "/jobs") {
         res.writeHead(200); res.end(JSON.stringify({ jobs: jobs.slice().reverse() })); return;
       }
-      // 运费模板列表（读取店铺 carriage/list 页）
+      // 运费模板列表（复用已打开的 carriage/list 标签；没有就返回空，绝不新建页面）
       if (req.method === "GET" && req.url === "/shipping-templates") {
-        const templates = context ? await fetchShippingTemplates(context) : [];
+        let templates = [];
+        try {
+          const { context: c } = await openBrowser();
+          const page = c.pages().find((p) => p.url().includes("carriage/list"));
+          if (page && !pddLoggedOut) templates = await readTemplatesFromPage(page);
+        } catch {}
         res.writeHead(200); res.end(JSON.stringify({ templates })); return;
       }
       if (req.method === "GET" && req.url === "/settings") {
@@ -1694,18 +1712,37 @@ async function main() {
         res.writeHead(200); res.end(JSON.stringify({ minProfit: next.minProfit, targetRoi: next.targetRoi, shippingCost: next.shippingCost, shippingTemplate: next.shippingTemplate, promiseHours: next.promiseHours })); return;
       }
       // 保存当前发布页为草稿（供人工在草稿箱核对，不提交上架）
+      // 真验证：点「保存草稿」→ 点弹窗「确定」→ 开草稿箱列表读「草稿箱(N)」数字，N 增长才算成功。
       if (req.method === "POST" && req.url === "/save-draft") {
         try {
+          assertLoggedIn(); // 掉登录直接熔断，绝不新建页面
           const { context: c } = await openBrowser();
-          const page = c.pages().find((p) => /goods_add/.test(p.url()));
-          if (!page) { res.writeHead(404); res.end(JSON.stringify({ error: "没有打开的商品发布页" })); return; }
+          const readDraftCount = async () => {
+            // 只复用已打开的草稿箱列表标签；没有就返回 null，绝不 newPage（防止掉登录时疯狂建窗口）
+            const list = c.pages().find((p) => /goods_list/.test(p.url()));
+            if (!list) return null;
+            try {
+              const txt = await list.locator("body").innerText({ timeout: 4000 }).catch(() => "");
+              const m = txt.match(/草稿箱\((\d+)\)/);
+              return m ? Number(m[1]) : null;
+            } catch { return null; }
+          };
+          const before = await readDraftCount();
+          const page = c.pages().find((p) => /goods_add/.test(p.url()) && !/login/.test(p.url()));
+          if (!page) { res.writeHead(404); res.end(JSON.stringify({ error: "没有打开的商品发布页（或已掉登录）" })); return; }
           await page.bringToFront();
-          const clicked = await page.getByText(/^保存草稿$/).first().click({ timeout: 5000 }).then(() => true).catch(() => false);
-          if (!clicked) { res.writeHead(500); res.end(JSON.stringify({ error: "没找到「保存草稿」按钮" })); return; }
+          const saveBtn = page.getByText(/^保存草稿$/).first();
+          if (!(await saveBtn.isVisible().catch(() => false))) { res.writeHead(500); res.end(JSON.stringify({ error: "没找到「保存草稿」按钮" })); return; }
+          await saveBtn.scrollIntoViewIfNeeded().catch(() => {});
+          await saveBtn.click({ timeout: 8000 }).catch(() => {});
+          await sleep(1500);
+          // 关掉「保存成功!」确认弹窗，否则草稿可能不真正落库
+          const confirm = page.getByText(/^确定$/).first();
+          if (await confirm.isVisible().catch(() => false)) await confirm.click().catch(() => {});
           await sleep(2000);
-          const body = await page.locator("body").innerText().catch(() => "");
-          const ok = /保存成功|草稿|保存草稿成功/.test(body);
-          res.writeHead(200); res.end(JSON.stringify({ ok, msg: ok ? "已保存草稿" : "已点击保存草稿，请到草稿箱确认" })); return;
+          const after = await readDraftCount();
+          const ok = before !== null && after !== null && after > before;
+          res.writeHead(200); res.end(JSON.stringify({ ok, before, after, msg: ok ? `草稿已入库（${before}→${after}）` : "点击了保存草稿，但草稿箱数字未增长，请人工确认" })); return;
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); return; }
       }
       // 清空历史任务记录（不动运行中的），便于串行地试下一个链接
@@ -1725,6 +1762,10 @@ async function main() {
         const lines = String(body.urls || "").split(/[\s,，;；]+/).map(x => x.trim()).filter(Boolean);
         const ids = [...new Set(lines.map(parseOfferId).filter(Boolean))];
         if (!ids.length) { res.writeHead(400); res.end(JSON.stringify({ error: "没有识别到有效的 1688 商品链接" })); return; }
+        // 掉登录熔断：拒绝新任务，避免掉登录后继续开页面/重定向刷屏
+        if (pddLoggedOut || loginStatus.pdd !== "logged_in") {
+          res.writeHead(503); res.end(JSON.stringify({ error: "拼多多登录已失效，已暂停全部任务。请先重新登录并点「重新检测」。" })); return;
+        }
         // 浏览器是单例，任务必须串行：有运行中或已停在提交前的任务时，拒绝新任务，避免抢页面
         if (jobs.some((j) => j.status === "running" || j.status === "queued" || (j.status === "filled" && mode !== "check"))) {
           res.writeHead(409); res.end(JSON.stringify({ error: "已有任务正在处理或停在提交前，请先处理完再提交（浏览器单例，任务需串行）" })); return;
@@ -1750,11 +1791,20 @@ async function main() {
         while (true) {
           const job = jobs.find(x => x.status === "queued");
           if (!job) { await sleep(700); continue; }
+          // 每个任务执行前刷新登录态；掉了就地熔断，该任务标记失败并停止后续处理
+          await refreshLoginStatus(context).catch(() => {});
+          if (pddLoggedOut) {
+            job.status = "failed"; job.stage = "已暂停：拼多多登录失效";
+            job.logs.push({ t: new Date().toISOString(), m: "拼多多登录已失效，任务熔断。请先重新登录并点「重新检测」，期间不会新建任何页面。" });
+            job.updatedAt = new Date().toISOString();
+            active = false;
+            await sleep(2000);
+            continue;
+          }
           active = true;
           job.status = "running";
           job.stage = "开始处理";
           const step = makeStep(job);
-          await refreshLoginStatus(context).catch(() => {});
           await runJob({ context, job, cfg: loadLocalConfig(), step, mode: job.mode });
           await refreshLoginStatus(context).catch(() => {});
           if (job.status === "running") { job.status = "failed"; job.stage = "任务结束但未返回结果"; }
