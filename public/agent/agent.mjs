@@ -913,27 +913,33 @@ async function applyAttrsFromProduct(page, product, step) {
     await step("  商品属性：采集数据里没有属性，保留页面为空（不一键复用、不瞎填）");
     return 0;
   }
-  // 配对：遍历所有文本节点式属性名，按 DOM 顺序找"紧随其后最近的可见 select/搜索 input"，
-  // 给该 input 打标记，返回 {属性名, 标记序号, 当前值}。
-  const fields = await page.evaluate(() => {
-    const vis = (e) => { try { return e.getClientRects().length > 0; } catch { return false; } };
+  // 配对：属性名是控件左侧、同一水平行（±18px）、最近的那个短文本。
+  // 实测靠 DOM 顺序配不准（属性是左右两列 Grid），必须用坐标判断。
+  // 注意：每填一项后页面会重渲染，标记会失效，所以每次循环都重新扫描。
+  const scanFields = () => page.evaluate(() => {
+    const vis = (e) => { try { const b = e.getBoundingClientRect(); return b.width > 0 && b.height > 0; } catch { return false; } };
     const txt = (e) => (e.innerText || e.textContent || "").trim();
-    const names = ["品牌", "重要适用类型", "重要笔头", "书写粗细", "风格", "是否可擦", "特点", "适用场景", "包装方式", "适用年龄段", "材质", "线幅", "用途", "货号", "型号", "是否进口"];
-    const all = [...document.querySelectorAll("*")];
     const out = [];
     let tag = 0;
-    for (const nm of names) {
-      const el = all.find((e) => vis(e) && txt(e) === nm && e.children.length <= 2);
-      if (!el) continue;
-      // 找 el 之后最近的可见 select/搜索 input（用 compareDocumentPosition）
-      const inputs = [...document.querySelectorAll('input[placeholder="请选择"],input[placeholder="请输入品牌名称搜索"]')].filter(vis);
+    document.querySelectorAll("[data-agent-attr]").forEach((e) => e.removeAttribute("data-agent-attr"));
+    for (const inp of [...document.querySelectorAll('input[placeholder="请选择"],input[placeholder="请输入品牌名称搜索"]')].filter(vis)) {
+      const r = inp.getBoundingClientRect();
       let best = null;
-      for (const inp of inputs) {
-        if ((el.compareDocumentPosition(inp) & Node.DOCUMENT_POSITION_FOLLOWING) && !inp.hasAttribute("data-agent-attr")) { best = inp; break; }
+      for (const el of document.querySelectorAll("div,span,label")) {
+        if (el.contains(inp) || inp.contains(el)) continue;
+        if (!vis(el)) continue;
+        const b = el.getBoundingClientRect();
+        if (Math.abs(b.top - r.top) > 18) continue;      // 同一行
+        if (b.right > r.left + 5) continue;              // 在控件左侧
+        const x = txt(el);
+        if (!x || x.length > 14) continue;
+        if (/请选择|请输入|填写率|没有合适|点击|未找到|上传|示例|展开|收起/.test(x)) continue;
+        if (el.children.length > 1) continue;
+        if (!best || b.right > best.right) best = { text: x, right: b.right };
       }
       if (!best) continue;
-      best.setAttribute("data-agent-attr", String(tag));
-      out.push({ name: nm, tag, val: best.value || "" });
+      inp.setAttribute("data-agent-attr", String(tag));
+      out.push({ name: best.text, tag, val: inp.value || "" });
       tag++;
     }
     return out;
@@ -941,53 +947,107 @@ async function applyAttrsFromProduct(page, product, step) {
 
   let filled = 0;
   const skipped = [];
-  for (const f of fields) {
-    // 找采集属性值：同名优先，其次走映射表
-    let value = attrs[f.name];
-    if (!value) {
-      for (const [src, targets] of Object.entries(ATTR_NAME_MAP)) {
-        if (targets.includes(f.name) && attrs[src]) { value = attrs[src]; break; }
-      }
+  const doneNames = new Set();
+  // 属性名 → 候选关键词（来自采集 attrs + 标题），用于在拼多多固定词库里语义匹配
+  const title = String(product.title || "");
+  const keywordFor = (name) => {
+    const list = [];
+    const push = (v) => { if (v) String(v).split(/[,，、\/]/).forEach((x) => { const t = x.trim(); if (t) list.push(t); }); };
+    // 1) 同名采集值
+    if (attrs[name]) push(attrs[name]);
+    // 2) 映射表里 1688 名 → 该属性
+    for (const [src, targets] of Object.entries(ATTR_NAME_MAP)) {
+      if (targets.includes(name) && attrs[src]) push(attrs[src]);
     }
-    if (!value) { skipped.push(`${f.name}(无采集值)`); continue; }
-    value = String(value).trim();
-    if (!value || value.length > 30) { skipped.push(`${f.name}(值过长/空)`); continue; }
+    // 3) 标题里出现的关键词（拼多多选项多为词库，标题常含）
+    const dict = {
+      "重要适用类型": ["中性笔", "圆珠笔", "签字笔", "马克笔", "荧光笔", "铅笔", "替芯", "笔芯"],
+      "重要笔头": ["子弹头", "针管", "ST头", "CS头", "葫芦头", "全针管", "半针管", "铅笔头"],
+      "风格": ["简约", "日系", "韩版", "商务", "可爱", "创意", "小清新", "中国风", "ins风", "影视动漫"],
+      "是否可擦": ["可擦", "不可擦"],
+      "特点": ["大容量", "速干", "顺滑"],
+      "适用场景": ["考试专用", "签字", "练字", "开学季"],
+      "包装方式": ["礼盒装", "袋装", "罐装", "瓶装", "盒装", "单支装"],
+      "适用年龄段": ["14岁以上", "6-14岁", "3-6岁"],
+    };
+    for (const k of (dict[name] || [])) if (title.includes(k) || (attrs[k] && String(attrs[k]).includes(k))) list.push(k);
+    // 4) 采集值里的可擦/不可擦、袋/盒 等直接判断
+    if (name === "是否可擦") {
+      const hay = title + JSON.stringify(attrs);
+      if (/可擦/.test(hay)) list.push("可擦");
+      if (/不可擦|不能擦/.test(hay)) list.push("不可擦");
+    }
+    return [...new Set(list.map((x) => String(x).trim()).filter(Boolean))];
+  };
 
+  // 每轮重新扫描（页面填一项后会重渲染），处理一个还没处理的属性，最多 20 轮
+  for (let round = 0; round < 20; round++) {
+    const fields = await scanFields();
+    const f = fields.find((x) => !doneNames.has(x.name));
+    if (!f) break;
+    doneNames.add(f.name);
     const ctrl = page.locator(`[data-agent-attr="${f.tag}"]`);
     if (!(await ctrl.count())) { skipped.push(`${f.name}(控件丢失)`); continue; }
+    // 已有值就跳过（尊重已填）
+    const curVal = String(await ctrl.inputValue().catch(() => "")).trim();
+    if (curVal) { filled++; continue; }
 
-    // 品牌：采集品牌无授权，按既有评估填"无品牌"（不冒充品牌）
+    // 品牌：拼多多品牌库无"无品牌"选项，搜不到就留空（不冒充品牌）
     if (f.name === "品牌") {
+      await ctrl.click({ force: true }).catch(() => {});
+      await sleep(400);
       await ctrl.fill("无品牌").catch(() => {});
-      await sleep(500);
-      const opt = page.getByText(/无品牌|其他/, { exact: false }).first();
-      if (await opt.isVisible().catch(() => false)) await opt.click().catch(() => {});
-      await sleep(300);
-      filled++;
-      await step(`  商品属性「品牌」：采集值「${value}」无授权，按规则填「无品牌」`);
+      await sleep(1200);
+      const opt = page.locator('[class*="cIL_item"]').filter({ hasText: /无品牌|其他/ }).first();
+      if (await opt.count() && await opt.isVisible().catch(() => false)) {
+        await opt.click({ force: true }).catch(() => {}); filled++;
+        await step("  商品属性「品牌」：填「无品牌」");
+      } else {
+        await step(`  商品属性「品牌」：采集「${attrs["品牌"] || "?"}」无授权，且品牌库无「无品牌」可选，留空`);
+      }
+      await page.keyboard.press("Escape").catch(() => {});
       continue;
     }
 
-    // 通用下拉：点开 → 在可见选项里找含采集值的项 → 点击；找不到不强行输入，留空记录
+    const kws = keywordFor(f.name);
+    if (!kws.length) { skipped.push(`${f.name}(无采集值)`); continue; }
+
+    // 点开下拉，读全部选项
+    await ctrl.scrollIntoViewIfNeeded().catch(() => {});
     await ctrl.click({ force: true }).catch(() => {});
-    await sleep(500);
-    const opts = await page.evaluate((v) => {
-      const vis = (e) => { try { return e.getClientRects().length > 0; } catch { return false; } };
-      const tx = (e) => (e.innerText || e.textContent || "").trim();
-      return [...document.querySelectorAll("li,[class*=option],[class*=Option],[role=option]")]
-        .filter(vis).map(tx).filter((t) => t && t.length < 40 && (t.includes(v) || v.includes(t))).slice(0, 5);
-    }, value).catch(() => []);
-    let picked = false;
-    for (const o of opts) {
-      const el = page.getByText(o, { exact: true }).first();
-      if (await el.isVisible().catch(() => false)) { await el.click().catch(() => {}); picked = true; break; }
+    await sleep(800);
+    const opts = await page.evaluate(() => {
+      const t = (e) => (e.innerText || e.textContent || "").trim();
+      const vis = (e) => { try { const b = e.getBoundingClientRect(); return b.width > 0 && b.height > 0; } catch { return false; } };
+      return [...document.querySelectorAll('[class*="cIL_item"],[role=option],li')].filter(vis).map(t).filter((x) => x && x.length < 20);
+    }).catch(() => []);
+    // 在选项里找最佳匹配：先精确、再包含
+    let chosen = null;
+    for (const kw of kws) {
+      chosen = opts.find((o) => o === kw) || chosen;
+      if (chosen) break;
     }
-    if (picked) { filled++; await step(`  商品属性「${f.name}」← 采集值「${value}」`); }
-    else { skipped.push(`${f.name}(下拉无「${value}」选项，留空待人工)`); }
+    if (!chosen) {
+      for (const kw of kws) {
+        chosen = opts.find((o) => o.includes(kw) || kw.includes(o));
+        if (chosen) break;
+      }
+    }
+    if (chosen) {
+      const el = page.locator('[class*="cIL_item"]').filter({ hasText: new RegExp(`^\\s*${chosen.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`) }).first();
+      if (await el.count() && await el.isVisible().catch(() => false)) {
+        await el.click({ force: true }).catch(() => {});
+        await sleep(400);
+        filled++;
+        await step(`  商品属性「${f.name}」← 「${chosen}」`);
+      } else { skipped.push(`${f.name}(匹配到「${chosen}」但点击失败)`); }
+    } else {
+      skipped.push(`${f.name}(词库无匹配：候选 ${kws.slice(0, 3).join("/")}；可选 ${opts.slice(0, 5).join("/")})`);
+    }
     await page.keyboard.press("Escape").catch(() => {});
-    await sleep(200);
+    await sleep(250);
   }
-  await step(`  商品属性：按采集信息填 ${filled} 项${skipped.length ? `；未填：${skipped.join("、")}` : ""}（未使用一键复用）`);
+  await step(`  商品属性：填了 ${filled} 项${skipped.length ? `；未填：${skipped.join("；")}` : ""}（未使用一键复用）`);
   return filled;
 }
 
@@ -1012,27 +1072,58 @@ async function applyServiceDefaults(page, cfg, step) {
 
 // 应用运费模板：服务与承诺区默认折叠，先点「展开修改」，
 // 再选「其他模板」radio，最后在出现的模板列表里按名称选择。
+// 选运费模板：实测结构是「服务与承诺」区里的 ST_selectValueSingle 下拉
+// （class 含 select_selectWrapper），点开后会列出 cIL_item 选项（含自定义模板如「123」）。
 async function applyShippingTemplate(page, name, step) {
   if (!name) return false;
-  // 1) 展开服务区
+  // 1) 若服务与承诺折叠，先展开
   const expand = page.getByText("展开修改", { exact: true }).first();
-  if (await expand.count()) await expand.click({ force: true }).catch(() => {});
-  await sleep(600);
-  // 2) 点「其他模板」radio（用 label 点击，不依赖视口可见性）
-  const other = page.locator('label:has-text("其他模板")').first();
-  if (await other.count()) await other.click({ force: true }).catch(() => {});
-  await sleep(800);
-  // 3) 按名称选择模板：优先精确文本，其次包含
-  let target = page.getByText(name, { exact: true }).first();
-  if (!(await target.isVisible().catch(() => false))) {
-    target = page.getByText(name, { exact: false }).first();
+  if (await expand.count() && await expand.isVisible().catch(() => false)) {
+    await expand.click({ force: true }).catch(() => {});
+    await sleep(1200);
   }
-  if (await target.isVisible().catch(() => false)) {
-    await target.click({ force: true }).catch(() => {});
-    await step(`  运费模板：已选「${name}」`);
-    return true;
+  const box = page.locator('[class*="template-box"]').first();
+  if (!(await box.count())) { await step("  ⚠ 未找到运费模板区域"); return false; }
+
+  // 2) 当前已是目标模板就不用动
+  const boxText = async () => (await box.innerText().catch(() => "")).replace(/\s+/g, "");
+  if ((await boxText()).includes(name.replace(/\s+/g, ""))) {
+    // 但要确认不是"其他模板"选项里的残留文字，简单判断：首行是目标
+    const firstLine = (await box.innerText().catch(() => "")).trim().split("\n").map(s => s.trim()).filter(Boolean)[0] || "";
+    if (firstLine.includes(name)) { await step(`  运费模板：已是「${name}」`); return true; }
   }
-  await step(`  ⚠ 运费模板「${name}」未在展开后的列表中找到，保留店铺默认模板（不影响提交）`);
+
+  // 3) 点「其他模板」radio 选中（template-box 内的第二个 radio label）
+  const other = box.locator('label').filter({ hasText: /^\s*其他模板\s*$/ }).first();
+  if (!(await other.count())) { await step("  ⚠ 未找到「其他模板」选项"); return false; }
+  await other.scrollIntoViewIfNeeded().catch(() => {});
+  await other.click({ force: true }).catch(() => {});
+  await sleep(1500);
+
+  // 4) 「其他模板」选中后会出现下拉（ST_selectValue / selectWrapper）
+  let sel = box.locator('[class*="selectWrapper"], [class*="select_selectWrapper"], [class*="ST_selectValue"]').first();
+  if (!(await sel.count())) {
+    // 也可能浮层渲染在 box 外，全局找一个
+    sel = page.locator('[class*="select_selectWrapper"], [class*="ST_selectValueSingle"]').filter({ hasText: /模板|包邮/ }).first();
+  }
+  if (!(await sel.count())) { await step("  ⚠ 选「其他模板」后未出现模板下拉"); return false; }
+  await sel.click({ force: true }).catch(() => {});
+  await sleep(1500);
+
+  // 5) 在 cIL_item 里精确点名称
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const opt = page.locator('[class*="cIL_item"]').filter({ hasText: new RegExp(`^\\s*${esc}\\s*$`) }).first();
+  if (await opt.count() && await opt.isVisible().catch(() => false)) {
+    await opt.click({ force: true }).catch(() => {});
+    await sleep(1200);
+    const now = (await box.innerText().catch(() => "")).trim();
+    const okNow = now.includes(name);
+    await step(`  运费模板：已选「${name}」${okNow ? "" : "（页面未回显，需核对）"}`);
+    return okNow;
+  }
+  const items = await page.locator('[class*="cIL_item"]').allInnerTexts().catch(() => []);
+  await page.keyboard.press("Escape").catch(() => {});
+  await step(`  ⚠ 运费模板「${name}」不在下拉中（可选：${items.slice(0, 10).join("、")}）`);
   return false;
 }
 
@@ -1513,14 +1604,23 @@ async function auditPublishForm(page, cfg) {
     const errM = body.match(/错误（(\d+)）/);
     const errorCount = errM ? Number(errM[1]) : 0;
 
-    // 5) 运费模板当前选中项
+    // 5) 运费模板当前选中项：读 template-box 内的下拉显示值（不是 radio 的"其他模板"标签）
     let shipping = "";
-    const shipLi = [...document.querySelectorAll("li,[class*=service-label],input[type=radio]")].filter(vis);
-    for (const el of document.querySelectorAll('input[type=radio]')) {
-      if (el.checked) {
-        let n = el; let lab = "";
-        for (let i = 0; i < 5 && n.parentElement; i++) { n = n.parentElement; const x = t(n); if (x && x.length < 40) { lab = x; break; } }
-        if (/模板/.test(lab)) shipping = lab.split("\n")[0].trim();
+    const tbox = document.querySelector('[class*="template-box"]');
+    if (tbox) {
+      // 下拉控件显示值（ST_selectValue*）
+      const selVal = [...tbox.querySelectorAll('[class*="ST_selectValue"], [class*="selectWrapper"], [class*="select_selectWrapper"]')]
+        .filter(vis).map((e) => t(e)).filter((x) => x && !/请选择|其他模板|推荐/.test(x));
+      if (selVal.length) shipping = selVal[0].split("\n")[0].trim();
+      // 兜底：radio 选中的模板名
+      if (!shipping) {
+        for (const el of tbox.querySelectorAll('input[type=radio]')) {
+          if (el.checked) {
+            let n = el, lab = "";
+            for (let i = 0; i < 5 && n.parentElement; i++) { n = n.parentElement; const x = t(n); if (x && x.length < 40) { lab = x; break; } }
+            if (/模板/.test(lab)) shipping = lab.split("\n")[0].trim();
+          }
+        }
       }
     }
 
@@ -1626,9 +1726,8 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   await step(`表单截图：${shot}`);
 
   // ── 验收门槛：读真实 DOM 体检，内容不全就不算填好 ──
-  // 把关标准＝平台自身的硬性要求，不叠加助手臆想的规则：
-  //   必拦：规格/价格库存为空、价格空行、平台报错（错误数>0）
-  //   不拦（平台默认可上架，仅影响流量，记日志提示人工）：属性填写率低、运费模板未切到指定项
+  // 用户明确要求：属性为空、运费模板没选定 = 不算成功。因此这两项也列为必拦。
+  //   必拦：规格/价格库存为空、价格空行、平台报错、运费模板未选中指定项、商品属性填写率为 0
   await sleep(1200);
   const audit = await auditPublishForm(page, cfg);
   const fails = [];
@@ -1638,10 +1737,14 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   if (audit.specRows <= 0) fails.push("规格/价格库存表 0 行（商品无法上架）");
   if (audit.specRows > 0 && audit.priceEmpty > 0) fails.push(`价格库存有空行 ${audit.priceEmpty}/${audit.specRows}`);
   if (audit.errorCount > 0) fails.push(`平台报错 ${audit.errorCount} 项`);
-  // 以下只提醒、不阻断
-  if (audit.attrRate !== null && audit.attrRate <= 0) warns.push("商品属性未填（仅影响流量，平台未报必填）");
-  if (cfg.shippingTemplate && audit.shipping !== cfg.shippingTemplate) warns.push(`运费模板未切到「${cfg.shippingTemplate}」（当前：${audit.shipping || "默认"}，平台默认有效）`);
+  // 用户硬要求：运费模板必须真选中；属性必须有填写
+  if (cfg.shippingTemplate && audit.shipping !== cfg.shippingTemplate) {
+    fails.push(`运费模板未选中「${cfg.shippingTemplate}」（当前：${audit.shipping || "未取到"}）`);
+  }
+  if (audit.attrRate !== null && audit.attrRate <= 0) fails.push("商品属性一项都没填（填写率 0%）");
+  // 其余只提醒
   if (audit.skuImgCount < audit.specRows) warns.push(`SKU 预览图缺 ${audit.specRows - audit.skuImgCount}/${audit.specRows}`);
+  if (audit.attrRate !== null && audit.attrRate > 0 && audit.attrRate < 30) warns.push(`属性填写率偏低 ${audit.attrRate}%`);
 
   await step(`表单体检：属性填写率 ${audit.attrRate ?? "?"}%、规格 ${audit.specRows} 行、价格空行 ${audit.priceEmpty}、SKU图 ${audit.skuImgCount}/${audit.specRows}、运费模板「${audit.shipping || "默认"}」、平台报错 ${audit.errorCount}`);
   for (const w of warns) await step(`  ⚠ ${w}`);
