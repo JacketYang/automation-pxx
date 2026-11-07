@@ -657,13 +657,16 @@ async function fillSkuTable(page, pricing, specs) {
   const cSingle = heads.findIndex((h) => /单买价/.test(h));
   if (cGroup < 0 && cStock < 0) return 0;
 
-  // 标记数据行：首列是 TD、无 input、有规格名文本（行是异步生成的，最多等 15 秒）
+  // 标记数据行：TD 行、含价格库存输入框（≥3 个 input）。无规格商品首列是空 TD，也要算。
   const markRows = async () => page.evaluate(() => {
     document.querySelectorAll("[data-agent-skurow]").forEach((e) => e.removeAttribute("data-agent-skurow"));
     for (const tb of document.querySelectorAll("table")) {
       const rows = [...tb.querySelectorAll("tr")].filter((tr) => {
-        const c = [...tr.querySelectorAll("td,th")];
-        return c.length >= 3 && c[0].tagName === "TD" && c[0].querySelectorAll("input").length === 0 && (c[0].innerText || "").trim();
+        const cells = [...tr.querySelectorAll("td,th")];
+        if (cells.length < 4) return false;
+        if (!cells.some((c) => c.tagName === "TD")) return false;      // 表头是 TH
+        const inpCount = tr.querySelectorAll("input:not([type=file])").length;
+        return inpCount >= 3;                                          // 库存/拼单价/单买价至少 3 个
       });
       if (rows.length) { rows.forEach((tr) => tr.setAttribute("data-agent-skurow", "1")); return rows.length; }
     }
@@ -716,14 +719,17 @@ async function fillSkuPreviewImages(page, files, step) {
       const i = h.findIndex((x) => /预览图/.test(x));
       if (i >= 0) return i;
     }
-    return 4; // 真实页面固定第 5 列
+    return -1; // 表头没有「预览图」列 = 无规格商品，不需要 SKU 预览图
   });
+  if (cImg < 0) { await step("  SKU 预览图：该商品无规格，无需 SKU 预览图"); return -1; }
   await page.evaluate(() => {
     document.querySelectorAll("[data-agent-skurow]").forEach((e) => e.removeAttribute("data-agent-skurow"));
     for (const tb of document.querySelectorAll("table")) {
       const rows = [...tb.querySelectorAll("tr")].filter((tr) => {
-        const c = [...tr.querySelectorAll("td,th")];
-        return c.length >= 3 && c[0].tagName === "TD" && c[0].querySelectorAll("input").length === 0 && (c[0].innerText || "").trim();
+        const cells = [...tr.querySelectorAll("td,th")];
+        if (cells.length < 4) return false;
+        if (!cells.some((c) => c.tagName === "TD")) return false;
+        return tr.querySelectorAll("input:not([type=file])").length >= 3;
       });
       if (rows.length) { rows.forEach((tr) => tr.setAttribute("data-agent-skurow", "1")); break; }
     }
@@ -1571,21 +1577,25 @@ async function auditPublishForm(page, cfg) {
     const rateM = body.match(/填写率\s*(\d+)%/);
     const attrRate = rateM ? Number(rateM[1]) : null;
 
-    // 2) 规格行 + 价格库存
-    let specRows = 0, priceFilled = 0, priceEmpty = 0, skuImgCount = 0;
+    // 2) 规格/价格库存行（无规格商品首列是空 TD，同样算数据行）
+    let specRows = 0, priceFilled = 0, priceEmpty = 0, skuImgCount = 0, hasImgCol = false;
+    { const hd = [...document.querySelectorAll("table")].map((tb) => [...tb.querySelectorAll("tr:first-child th,tr:first-child td")].map(t)).find((h) => h.some((x) => /拼单价/.test(x))) || [];
+      hasImgCol = hd.some((x) => /预览图/.test(x)); }
     for (const tb of document.querySelectorAll("table")) {
       const rows = [...tb.querySelectorAll("tr")].filter((tr) => {
-        const c = [...tr.querySelectorAll("td,th")];
-        return c.length >= 3 && c[0].tagName === "TD" && c[0].querySelectorAll("input").length === 0 && t(c[0]);
+        const cells = [...tr.querySelectorAll("td,th")];
+        if (cells.length < 4) return false;
+        if (!cells.some((c) => c.tagName === "TD")) return false;
+        return tr.querySelectorAll("input:not([type=file])").length >= 3;
       });
       if (!rows.length) continue;
       specRows = Math.max(specRows, rows.length);
       for (const tr of rows) {
         const cells = [...tr.querySelectorAll("td,th")];
-        // 第2/3/4 列是 库存/拼单价/单买价
-        const vals = [1, 2, 3].map((i) => { const inp = cells[i]?.querySelector("input"); return inp ? String(inp.value || "").trim() : ""; });
-        if (vals.every((v) => v !== "" && Number(v) >= 0)) priceFilled++; else priceEmpty++;
-        // 预览图列：已上传判据 = 有 img 或已出现 imageWrapper 容器且不再显示"本地上传"
+        // 价格库存三列：从含 input 的单元格按顺序取（兼容有/无规格首列）
+        const inpCells = cells.filter((c) => c.querySelector("input:not([type=file])"));
+        const vals = inpCells.slice(0, 3).map((c) => String(c.querySelector("input:not([type=file])").value || "").trim());
+        if (vals.length >= 3 && vals.every((v) => v !== "" && Number(v) >= 0)) priceFilled++; else priceEmpty++;
         const imgCell = cells.find((c) => {
           const hasImg = c.querySelector("img[src*='http'], img[src*='alicdn'], img[src^='data:']");
           const wrapper = c.querySelector('[class*="materialContainer"], [class*="imageWrapper"]');
@@ -1624,7 +1634,7 @@ async function auditPublishForm(page, cfg) {
       }
     }
 
-    return { attrRate, specRows, skuSpecCount, priceFilled, priceEmpty, skuImgCount, errorCount, shipping };
+    return { attrRate, specRows, skuSpecCount, priceFilled, priceEmpty, skuImgCount, hasImgCol, errorCount, shipping };
   });
   return r;
 }
@@ -1693,18 +1703,17 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
       : (files.gallery && files.gallery.length ? files.gallery : files.detail || []);
     if (!pool.length) throw new Error("没有可用图片做 SKU 预览图");
     const n = await fillSkuPreviewImages(page, pool, step);
+    if (n === -1) return;              // 无规格商品，不需要 SKU 预览图
     if (!n) throw new Error("SKU 预览图一张都没上传成功");
   });
   // 平台可能在规格录入被拒后异步补出空数据行；循环补填，确保每行都有价格库存（否则提交被拦）
   await attempt("价格库存表补填空行", async () => {
-    let total = 0;
+    // 只是补齐：前面已填满时返回 0 属正常，不抛错
     for (let round = 0; round < 8; round++) {
       await sleep(800);
       const n = await fillSkuTable(page, pricing, specs);
       if (!n) break;
-      total += n;
     }
-    if (!total) throw new Error("没有可补填的价格库存行");
   });
   if (!priced && pricing.skus.length === 1) {
     const s = pricing.skus[0];
@@ -1743,7 +1752,7 @@ async function publishToPdd({ context, product, pricing, pddTitle, files, cfg, m
   }
   if (audit.attrRate !== null && audit.attrRate <= 0) fails.push("商品属性一项都没填（填写率 0%）");
   // 其余只提醒
-  if (audit.skuImgCount < audit.specRows) warns.push(`SKU 预览图缺 ${audit.specRows - audit.skuImgCount}/${audit.specRows}`);
+  if (audit.hasImgCol && audit.skuImgCount < audit.specRows) warns.push(`SKU 预览图缺 ${audit.specRows - audit.skuImgCount}/${audit.specRows}`);
   if (audit.attrRate !== null && audit.attrRate > 0 && audit.attrRate < 30) warns.push(`属性填写率偏低 ${audit.attrRate}%`);
 
   await step(`表单体检：属性填写率 ${audit.attrRate ?? "?"}%、规格 ${audit.specRows} 行、价格空行 ${audit.priceEmpty}、SKU图 ${audit.skuImgCount}/${audit.specRows}、运费模板「${audit.shipping || "默认"}」、平台报错 ${audit.errorCount}`);
@@ -2028,33 +2037,33 @@ async function main() {
           }
           const { context: c } = await openBrowser();
           // 保证有一个草稿箱列表标签并读到数字（复用它，不新建第二个）
-          const ensureListPage = async () => {
-            let list = c.pages().find((p) => /goods_list/.test(p.url()) && !/\/login\//.test(p.url()));
-            if (list) return list;
-            // 没有就打开一个（已登录的正常业务页；未登录时前面 assertLoggedIn 已拦截）
+          // 每次都开一个全新页面读草稿箱，读完就关 —— 不复用可能被污染的页面。
+          // 返回 {count, names[]}，count 为 null 表示读不到。
+          const readDraftState = async () => {
+            let list = null;
             try {
               list = await c.newPage();
               await list.goto("https://mms.pinduoduo.com/goods/goods_list?activeKeyNew=key_7", { waitUntil: "domcontentloaded", timeout: 60000 });
-              await sleep(3000);
-              // 若被重定向到登录页，说明掉登录，不再往下
-              if (/\/login\//.test(list.url())) { await list.close().catch(() => {}); return null; }
-              return list;
-            } catch { return null; }
+              // 等"草稿箱(N)"出现
+              for (let t = 0; t < 12; t++) {
+                await sleep(1000);
+                const txt = await list.locator("body").innerText({ timeout: 4000 }).catch(() => "");
+                const m = txt.match(/草稿箱\((\d+)\)/);
+                if (m) {
+                  // 同时取列表里的商品名，用于双重校验
+                  const names = await list.evaluate(() => {
+                    const t = (e) => (e.innerText || e.textContent || "").trim();
+                    return [...document.querySelectorAll("tr")].map((tr) => t(tr)).filter((x) => /ID:\s*\d{6,}/.test(x)).map((x) => x.split("\n")[0].trim()).slice(0, 60);
+                  }).catch(() => []);
+                  return { count: Number(m[1]), names };
+                }
+              }
+              return { count: null, names: [] };
+            } catch { return { count: null, names: [] }; }
+            finally { if (list) await list.close().catch(() => {}); }
           };
-          const readDraftCount = async (forceReload = false) => {
-            const list = await ensureListPage();
-            if (!list) return null;
-            if (forceReload) { await list.reload({ waitUntil: "domcontentloaded" }).catch(() => {}); await sleep(2500); }
-            for (let t = 0; t < 10; t++) {
-              const txt = await list.locator("body").innerText({ timeout: 5000 }).catch(() => "");
-              const m = txt.match(/草稿箱\((\d+)\)/);
-              if (m) return Number(m[1]);
-              await list.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-              await sleep(2000);
-            }
-            return null;
-          };
-          const before = await readDraftCount(true);
+          const beforeState = await readDraftState();
+          const before = beforeState.count;
           // before 读不到也继续：先保存，再用 after 判断；读不到只影响"数字对比"，不影响保存本身
           const page = c.pages().find((p) => /goods_add/.test(p.url()) && !/login/.test(p.url()));
           if (!page) { res.writeHead(404); res.end(JSON.stringify({ error: "没有打开的商品发布页（或已掉登录）", tabs: c.pages().map((p) => p.url().slice(0, 60)) })); return; }
@@ -2075,14 +2084,19 @@ async function main() {
             if (await txtBtn.count()) { await txtBtn.click({ force: true }).catch(() => {}); confirmed = true; break; }
           }
           await sleep(2000);
-          // 点确定后必须重新加载列表页才能拿到新数字
-          const after = await readDraftCount(true);
-          // 判定：①数字增长 ②或点确定成功且 after 读到了数字（说明至少列表正常、保存流程走完）
+          // 用全新页面复核草稿箱（数字 + 列表条目）
+          const afterState = await readDraftState();
+          const after = afterState.count;
           const grew = before !== null && after !== null && after > before;
-          const ok = grew || (confirmed && after !== null);
+          // 若数字读不到，退化为"确认弹窗已关 + 当前商品标题出现在草稿列表里"
+          const pageTitleKey = (await page.locator('input[placeholder*="商品描述"],input[placeholder*="最多输入30个汉字"]').first().inputValue().catch(() => "")).slice(0, 12);
+          const listed = !!pageTitleKey && afterState.names.some((n) => n.includes(pageTitleKey));
+          const ok = grew || listed || (confirmed && after !== null);
           res.writeHead(200); res.end(JSON.stringify({
-            ok, confirmed, before, after,
-            msg: grew ? `草稿已入库（${before}→${after}）` : (ok ? `已保存草稿并确认（草稿箱 ${after}）` : "保存草稿未确认，请人工核对草稿箱"),
+            ok, confirmed, before, after, listed,
+            msg: grew ? `草稿已入库（${before}→${after}）`
+              : listed ? `草稿已入库（列表已出现该商品，当前 ${after ?? "?"} 条）`
+              : (ok ? `已保存草稿并确认（草稿箱 ${after ?? "?"}）` : "保存草稿未确认，请人工核对草稿箱"),
           })); return;
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); return; }
       }
